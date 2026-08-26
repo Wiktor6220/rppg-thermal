@@ -16,7 +16,7 @@ def run(subject_dir):
         rgb_frames, thermal_frames, roi_positions, valid
     )
 
-    rppg_signal = methods.method_pos(rgb_trace, config.FS)
+    rppg_signal = methods.pos(rgb_trace, config.FS)
 
     filtered_signal = estimate.bandpass_filter(
         rppg_signal, config.FS, config.BAND_LOW_HZ, config.BAND_HIGH_HZ
