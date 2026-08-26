@@ -23,4 +23,27 @@ dependencies = [
 dev = [
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
 ]
+
+[tool.pytest.ini_options]
+# Testy importują z src/ jako `from src.methods import ...` — dodajemy root do ścieżki.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*.ipynb"]  # puste/eksploracyjne notebooki poza lintingiem
+
+[tool.ruff.lint]
+# Minimalny, sensowny zestaw: pyflakes (F), błędy pycodestyle (E), sortowanie importów (I),
+# modernizacja składni (UP), wychwytywanie typowych błędów (B).
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true  # mediapipe/scipy/sklearn nie dostarczają stubów typów
+files = ["src"]

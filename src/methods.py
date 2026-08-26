@@ -13,6 +13,7 @@ from scipy.signal import periodogram
 from sklearn.decomposition import FastICA
 
 from src.config import BAND_HIGH_HZ, BAND_LOW_HZ
+from src.estimate import bandpass_filter
 
 _EPS = 1e-8
 _WINDOW_SEC = 1.6  # długość okna dla CHROM/POS (de Haan & Jeanne 2013; Wang et al. 2017)
@@ -51,8 +52,11 @@ def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
     Sygnały chrominancji Xs = 3*Rn - 2*Gn, Ys = 1.5*Rn + Gn - 1.5*Bn liczone są
     w przesuwanym oknie o długości ~1.6 s, gdzie Rn/Gn/Bn to kanały znormalizowane
     przez swoją średnią w obrębie okna (temporal normalization, nigdy per klatka).
-    Współczynnik alpha = std(Xs)/std(Ys) usuwa składową tonu skóry, pozostawiając
-    pulsację. Okna łączone są metodą overlap-add.
+    W wariancie kanonicznym (de Haan & Jeanne, 2013) Xs i Ys są przed wyznaczeniem
+    alpha filtrowane pasmowo do zakresu HR — dzięki temu współczynnik
+    alpha = std(Xf)/std(Yf) dostraja się do składowej pulsacyjnej, a nie do wolnego
+    dryfu czy szumu poza pasmem. Sygnał chrominancji to Xf - alpha*Yf. Okna łączone
+    są metodą overlap-add.
 
     Args:
         rgb_trace: tablica (N, 3) średnich wartości R, G, B w czasie.
@@ -74,8 +78,12 @@ def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
         x_s = 3.0 * r_n - 2.0 * g_n
         y_s = 1.5 * r_n + g_n - 1.5 * b_n
 
-        alpha = np.std(x_s) / (np.std(y_s) + _EPS)
-        chrom_window = x_s - alpha * y_s
+        # Kanoniczny CHROM: filtracja pasmowa Xs/Ys w oknie przed policzeniem alpha.
+        x_f = bandpass_filter(x_s, fs)
+        y_f = bandpass_filter(y_s, fs)
+
+        alpha = np.std(x_f) / (np.std(y_f) + _EPS)
+        chrom_window = x_f - alpha * y_f
         chrom_window -= chrom_window.mean()
 
         signal[start : start + window_len] += chrom_window
@@ -159,69 +167,3 @@ def ica_method(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
             best_idx = i
 
     return sources[:, best_idx]
-
-
-def _dominant_hr_bpm(signal: np.ndarray, fs: float) -> float:
-    """Pomocnicza estymata HR z piku widma mocy w paśmie fizjologicznym — tylko do testu."""
-    freqs, psd = periodogram(signal, fs=fs)
-    band_mask = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
-    band_freqs, band_psd = freqs[band_mask], psd[band_mask]
-    peak_freq = band_freqs[np.argmax(band_psd)]
-    return peak_freq * 60.0
-
-
-def _generate_synthetic_rgb(
-    fs: float = 30.0,
-    duration_s: float = 30.0,
-    hr_bpm: float = 72.0,
-    seed: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generuje syntetyczny sygnał RGB z osadzonym tętnem, szumem i wolnym dryfem."""
-    rng = np.random.default_rng(seed)
-    n_samples = int(round(fs * duration_s))
-    t = np.arange(n_samples) / fs
-
-    dc = np.array([120.0, 135.0, 115.0])  # baza (ton skóry, jednostki dowolne)
-    pulse_weights = np.array([0.35, 1.0, 0.55])  # względna amplituda pulsacji per kanał
-    pulse_amplitude = 0.02  # ~2% modulacji względem DC
-
-    pulse_freq_hz = hr_bpm / 60.0
-    pulse = np.sin(2 * np.pi * pulse_freq_hz * t)
-    pulse_component = pulse_amplitude * dc[None, :] * pulse_weights[None, :] * pulse[:, None]
-
-    drift = 0.1 * dc[None, :] * np.sin(2 * np.pi * 0.02 * t)[:, None]  # wolny dryf oświetlenia
-    motion = dc[None, :] * rng.normal(0.0, 0.01, size=(n_samples, 1))  # artefakt ruchu (wspólny)
-    noise = rng.normal(0.0, 0.3, size=(n_samples, 3))  # szum pomiarowy per kanał
-
-    rgb_trace = dc[None, :] + pulse_component + drift + motion + noise
-    return rgb_trace, t
-
-
-if __name__ == "__main__":
-    FS_TEST = 30.0
-    TRUE_HR_BPM = 72.0
-    TOLERANCE_BPM = 5.0
-
-    rgb_signal, _ = _generate_synthetic_rgb(fs=FS_TEST, duration_s=30.0, hr_bpm=TRUE_HR_BPM)
-
-    methods_under_test = {
-        "GREEN": green,
-        "CHROM": chrom,
-        "POS": pos,
-        "ICA": ica_method,
-    }
-
-    print(f"Zadana częstość: {TRUE_HR_BPM} BPM (tolerancja ±{TOLERANCE_BPM} BPM)\n")
-
-    all_passed = True
-    for name, method_fn in methods_under_test.items():
-        pulse_signal = method_fn(rgb_signal, FS_TEST)
-        estimated_bpm = _dominant_hr_bpm(pulse_signal, FS_TEST)
-        error_bpm = abs(estimated_bpm - TRUE_HR_BPM)
-        passed = error_bpm <= TOLERANCE_BPM
-        all_passed &= passed
-        status = "OK" if passed else "FAIL"
-        print(f"[{status}] {name}: estymacja {estimated_bpm:.2f} BPM (błąd {error_bpm:.2f} BPM)")
-
-    assert all_passed, "Co najmniej jedna metoda przekroczyła tolerancję błędu HR."
-    print("\nWszystkie metody w granicach tolerancji.")

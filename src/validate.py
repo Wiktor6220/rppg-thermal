@@ -15,7 +15,9 @@ from src.config import MIN_VALID_RATIO, VALIDATION_STEP_SEC, VALIDATION_WINDOW_S
 from src.estimate import bandpass_filter, detrend_signal, estimate_hr_peaks, estimate_hr_welch
 
 
-def _window_bounds(n_samples: int, fs: float, window_s: float, step_s: float) -> list[tuple[int, int]]:
+def _window_bounds(
+    n_samples: int, fs: float, window_s: float, step_s: float
+) -> list[tuple[int, int]]:
     """Wyznacza indeksy (start, koniec) kolejnych przesuwanych okien próbek."""
     window_len = int(round(window_s * fs))
     step_len = int(round(step_s * fs))
@@ -45,7 +47,8 @@ def split_into_windows(
         Lista fragmentów sygnału (okien), każdy jako 1D tablica.
     """
     signal = np.asarray(signal, dtype=np.float64)
-    return [signal[start:end] for start, end in _window_bounds(signal.shape[0], fs, window_s, step_s)]
+    bounds = _window_bounds(signal.shape[0], fs, window_s, step_s)
+    return [signal[start:end] for start, end in bounds]
 
 
 def compute_mae(estimated: np.ndarray, reference: np.ndarray) -> float:
@@ -227,74 +230,3 @@ def validate_signal(
         "mae_bpm": metrics["mae_bpm"],
         "rmse_bpm": metrics["rmse_bpm"],
     }
-
-
-def _generate_two_stage_pulse(
-    fs: float, duration_s: float, hr_bpm_stage1: float, hr_bpm_stage2: float, noise_std: float, seed: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generuje parę (czysty, zaszumiony) sygnał pulsacyjny ze skokową zmianą HR w połowie."""
-    rng = np.random.default_rng(seed)
-    n_samples = int(round(fs * duration_s))
-    half = n_samples // 2
-
-    inst_freq_hz = np.concatenate(
-        [np.full(half, hr_bpm_stage1 / 60.0), np.full(n_samples - half, hr_bpm_stage2 / 60.0)]
-    )
-    phase = 2 * np.pi * np.cumsum(inst_freq_hz) / fs
-    clean = np.sin(phase) + 0.3 * np.sin(2 * phase)  # harmoniczna -> ostrzejsze piki, jak w PPG
-    noisy = clean + rng.normal(0.0, noise_std, size=n_samples)
-    return clean, noisy
-
-
-if __name__ == "__main__":
-    FS_TEST = 30.0
-    DURATION_S = 40.0
-    HR_STAGE1_BPM = 65.0
-    HR_STAGE2_BPM = 85.0
-    TOLERANCE_BPM = 5.0
-
-    reference_clean, estimated_noisy = _generate_two_stage_pulse(
-        fs=FS_TEST,
-        duration_s=DURATION_S,
-        hr_bpm_stage1=HR_STAGE1_BPM,
-        hr_bpm_stage2=HR_STAGE2_BPM,
-        noise_std=0.2,
-        seed=1,
-    )
-    n_samples = estimated_noisy.shape[0]
-
-    # Symulacja utraty ROI (np. obrót głowy) przez 10 s: okno 10-20 s w całości nieważne.
-    valid_vector = np.ones(n_samples, dtype=bool)
-    valid_vector[300:600] = False
-
-    result = validate_signal(estimated_noisy, reference_clean, FS_TEST, valid=valid_vector)
-
-    print(f"Skok HR: {HR_STAGE1_BPM} -> {HR_STAGE2_BPM} BPM w połowie nagrania (t=20s)")
-    print(f"Okna: {result['n_windows_total']} łącznie, {result['n_windows_used']} użytych w metrykach\n")
-
-    print(f"{'start [s]':>10} {'est [bpm]':>10} {'ref [bpm]':>10} {'błąd':>8} {'użyte':>7}")
-    for start_s, est, ref, err, used in zip(
-        result["window_start_s"],
-        result["estimated_hr_bpm"],
-        result["reference_hr_bpm"],
-        result["error_bpm"],
-        result["window_used"],
-    ):
-        print(f"{start_s:>10.1f} {est:>10.2f} {ref:>10.2f} {err:>8.2f} {str(used):>7}")
-
-    print(f"\nMAE = {result['mae_bpm']:.2f} bpm, RMSE = {result['rmse_bpm']:.2f} bpm")
-
-    idx_10s = int(np.where(np.isclose(result["window_start_s"], 10.0))[0][0])
-    assert not result["window_used"][idx_10s], "Okno 10-20s powinno zostać pominięte (100% nieważne)."
-    assert np.isnan(result["estimated_hr_bpm"][idx_10s]), "Pominięte okno powinno mieć NaN."
-
-    idx_0s = int(np.where(np.isclose(result["window_start_s"], 0.0))[0][0])
-    idx_30s = int(np.where(np.isclose(result["window_start_s"], 30.0))[0][0])
-    err_stage1 = abs(result["estimated_hr_bpm"][idx_0s] - HR_STAGE1_BPM)
-    err_stage2 = abs(result["estimated_hr_bpm"][idx_30s] - HR_STAGE2_BPM)
-
-    assert err_stage1 <= TOLERANCE_BPM, f"Okno 0-10s: błąd {err_stage1:.2f} bpm przekracza tolerancję."
-    assert err_stage2 <= TOLERANCE_BPM, f"Okno 30-40s: błąd {err_stage2:.2f} bpm przekracza tolerancję."
-    assert result["n_windows_used"] == result["n_windows_total"] - 1, "Powinno zostać pominięte 1 okno."
-
-    print("\nTest zaliczony: skok HR śledzony per okno, okno z utraconym ROI poprawnie pominięte.")

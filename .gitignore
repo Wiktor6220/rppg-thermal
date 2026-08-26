@@ -6,3 +6,4 @@ __pycache__/
 .cloude
 CLAUDE.md
 CONTEXT.md
+.claude/

@@ -2,7 +2,7 @@
 
 import numpy as np
 from scipy import sparse
-from scipy.signal import butter, find_peaks, sosfiltfilt, welch
+from scipy.signal import butter, find_peaks, periodogram, sosfiltfilt, welch
 
 from src.config import (
     BAND_HIGH_HZ,
@@ -11,6 +11,8 @@ from src.config import (
     DETREND_LAMBDA,
     WELCH_SEGMENT_SEC,
 )
+
+_EPS = 1e-12
 
 
 def detrend_signal(signal: np.ndarray, lambda_param: float = DETREND_LAMBDA) -> np.ndarray:
@@ -118,54 +120,48 @@ def estimate_hr_peaks(signal: np.ndarray, fs: float) -> float:
     return 60.0 / mean_interval_s
 
 
-def _generate_synthetic_pulse(
-    fs: float = 30.0,
-    duration_s: float = 60.0,
-    hr_bpm: float = 72.0,
-    seed: int = 0,
-) -> np.ndarray:
-    """Generuje syntetyczny sygnał pulsacyjny 1D z dryfem i szumem — tylko do testu."""
-    rng = np.random.default_rng(seed)
-    n_samples = int(round(fs * duration_s))
-    t = np.arange(n_samples) / fs
+def snr_rppg(
+    signal: np.ndarray,
+    fs: float,
+    ref_hr_bpm: float,
+    n_harmonics: int = 2,
+    bin_width_hz: float = 0.2,
+) -> float:
+    """Stosunek sygnału do szumu (SNR) sygnału rPPG względem znanej częstości HR.
 
-    pulse_freq_hz = hr_bpm / 60.0
-    # Druga harmoniczna nadaje przebiegowi ostrzejsze piki, bliższe kształtowi PPG.
-    pulse = np.sin(2 * np.pi * pulse_freq_hz * t) + 0.3 * np.sin(2 * np.pi * 2 * pulse_freq_hz * t)
+    Miara w duchu de Haan & Jeanne (2013): moc skupiona w wąskich prążkach wokół
+    częstości podstawowej HR i jej harmonicznych („sygnał tętna") odniesiona do
+    mocy w pozostałej części pasma fizjologicznego („reszta"). Im czystszy sygnał
+    pulsacyjny (mniej artefaktów ruchu/szumu w paśmie), tym wyższe SNR. Pozwala
+    różnicować metody rPPG tam, gdzie sama estymata HR jeszcze się nie rozjeżdża.
 
-    drift = 5.0 * np.sin(2 * np.pi * 0.02 * t) + 0.05 * t  # wolny dryf: sinusoida + liniowy trend
-    noise = rng.normal(0.0, 0.15, size=n_samples)
+    Args:
+        signal: 1D sygnał rPPG (wyjście metody z `methods.py`).
+        fs: częstotliwość próbkowania sygnału (Hz).
+        ref_hr_bpm: referencyjna (znana) częstość HR w bpm, wokół której skupiona
+            jest oczekiwana moc pulsacji.
+        n_harmonics: liczba uwzględnianych harmonicznych (1 = tylko podstawowa).
+        bin_width_hz: połowa szerokości prążka wokół każdej harmonicznej (Hz).
 
-    return pulse + drift + noise
+    Returns:
+        SNR w decybelach (10*log10(moc_sygnału / moc_reszty_pasma)).
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    freqs, psd = periodogram(signal, fs=fs)
 
+    band_mask = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
 
-if __name__ == "__main__":
-    FS_TEST = 30.0
-    TRUE_HR_BPM = 72.0
-    TOLERANCE_BPM = 5.0
+    f0_hz = ref_hr_bpm / 60.0
+    signal_mask = np.zeros_like(freqs, dtype=bool)
+    for k in range(1, n_harmonics + 1):
+        center = k * f0_hz
+        if center > BAND_HIGH_HZ:
+            break
+        signal_mask |= np.abs(freqs - center) <= bin_width_hz
+    signal_mask &= band_mask
 
-    raw_signal = _generate_synthetic_pulse(fs=FS_TEST, duration_s=60.0, hr_bpm=TRUE_HR_BPM)
+    noise_mask = band_mask & ~signal_mask
 
-    detrended = detrend_signal(raw_signal)
-    filtered = bandpass_filter(detrended, FS_TEST)
-
-    hr_welch = estimate_hr_welch(filtered, FS_TEST)
-    hr_peaks = estimate_hr_peaks(filtered, FS_TEST)
-
-    print(f"Zadana częstość: {TRUE_HR_BPM} BPM (tolerancja ±{TOLERANCE_BPM} BPM)\n")
-
-    results = {"Welch (widmo mocy)": hr_welch, "find_peaks (dziedzina czasu)": hr_peaks}
-    all_passed = True
-    for name, hr_bpm in results.items():
-        error_bpm = abs(hr_bpm - TRUE_HR_BPM)
-        passed = error_bpm <= TOLERANCE_BPM
-        all_passed &= passed
-        status = "OK" if passed else "FAIL"
-        print(f"[{status}] {name}: {hr_bpm:.2f} BPM (błąd {error_bpm:.2f} BPM)")
-
-    agreement_bpm = abs(hr_welch - hr_peaks)
-    print(f"\nRozbieżność między metodami: {agreement_bpm:.2f} BPM")
-
-    assert all_passed, "Co najmniej jedna metoda estymacji HR przekroczyła tolerancję błędu."
-    assert agreement_bpm <= TOLERANCE_BPM, "Metody Welch i find_peaks znacząco się rozjeżdżają."
-    print("Obie metody w granicach tolerancji i zgodne ze sobą.")
+    signal_power = psd[signal_mask].sum()
+    noise_power = psd[noise_mask].sum()
+    return 10.0 * np.log10((signal_power + _EPS) / (noise_power + _EPS))

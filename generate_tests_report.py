@@ -1,12 +1,11 @@
 """Uruchamia testy syntetyczne z src/methods.py, src/estimate.py i src/validate.py
 i zbiera wyniki do jednego raportu (results/tests_report.md).
 
-Wykorzystuje wyłącznie istniejące funkcje generujące sygnał syntetyczny
-(`_generate_synthetic_rgb`, `_generate_synthetic_pulse`, `_generate_two_stage_pulse`)
-oraz istniejące metody/estymatory z tych modułów — nie tworzy nowych danych
-ani nowej logiki. Parametry (fs, długość, zadana częstość, seed) są takie same,
-jak w blokach `if __name__ == "__main__":` poszczególnych modułów, więc wynik
-jest powtarzalny.
+Wykorzystuje generatory sygnału syntetycznego z `tests/synthetic.py`
+(`generate_synthetic_rgb`, `generate_synthetic_pulse`, `generate_two_stage_pulse`)
+oraz metody/estymatory z modułów `src/` — nie tworzy nowej logiki. Parametry
+(fs, długość, zadana częstość, seed) są takie same jak w testach pytest, więc
+wynik jest powtarzalny.
 
 Awaria pojedynczego testu (wyjątek albo przekroczona tolerancja) nie przerywa
 raportu — jest w nim odnotowana jako FAIL/ERROR.
@@ -17,17 +16,17 @@ from datetime import datetime
 import numpy as np
 
 from src import config
-from src.estimate import (
-    _generate_synthetic_pulse,
-    bandpass_filter,
-    detrend_signal,
-    estimate_hr_peaks,
-    estimate_hr_welch,
+from src.estimate import bandpass_filter, detrend_signal, estimate_hr_peaks, estimate_hr_welch
+from src.methods import chrom, green, ica_method, pos
+from src.validate import validate_signal
+from tests.synthetic import (
+    dominant_hr_bpm,
+    generate_synthetic_pulse,
+    generate_synthetic_rgb,
+    generate_two_stage_pulse,
 )
-from src.methods import _dominant_hr_bpm, _generate_synthetic_rgb, chrom, green, ica_method, pos
-from src.validate import _generate_two_stage_pulse, validate_signal
 
-TOLERANCE_BPM = 5.0  # tolerancja błędu HR — spójna z testami __main__ w każdym module
+TOLERANCE_BPM = 5.0  # tolerancja błędu HR — spójna z testami pytest w każdym module
 REPORT_PATH = config.RESULTS_DIR / "tests_report.md"
 
 
@@ -35,8 +34,11 @@ def run_methods_test() -> dict:
     """Powtarza test z src/methods.py: GREEN/CHROM/POS/ICA na syntetycznym RGB."""
     params = {"fs_hz": 30.0, "duration_s": 30.0, "hr_bpm": 72.0, "noise_std": 0.3, "seed": 0}
 
-    rgb_signal, _ = _generate_synthetic_rgb(
-        fs=params["fs_hz"], duration_s=params["duration_s"], hr_bpm=params["hr_bpm"], seed=params["seed"]
+    rgb_signal, _ = generate_synthetic_rgb(
+        fs=params["fs_hz"],
+        duration_s=params["duration_s"],
+        hr_bpm=params["hr_bpm"],
+        seed=params["seed"],
     )
 
     methods_under_test = {"GREEN": green, "CHROM": chrom, "POS": pos, "ICA": ica_method}
@@ -44,7 +46,7 @@ def run_methods_test() -> dict:
     for name, method_fn in methods_under_test.items():
         try:
             pulse_signal = method_fn(rgb_signal, params["fs_hz"])
-            estimated_bpm = _dominant_hr_bpm(pulse_signal, params["fs_hz"])
+            estimated_bpm = dominant_hr_bpm(pulse_signal, params["fs_hz"])
             error_bpm = abs(estimated_bpm - params["hr_bpm"])
             status = "OK" if error_bpm <= TOLERANCE_BPM else "FAIL (poza tolerancją)"
             rows.append((name, params["hr_bpm"], estimated_bpm, error_bpm, status))
@@ -60,12 +62,18 @@ def run_estimate_test() -> dict:
 
     rows = []
     try:
-        raw_signal = _generate_synthetic_pulse(
-            fs=params["fs_hz"], duration_s=params["duration_s"], hr_bpm=params["hr_bpm"], seed=params["seed"]
+        raw_signal = generate_synthetic_pulse(
+            fs=params["fs_hz"],
+            duration_s=params["duration_s"],
+            hr_bpm=params["hr_bpm"],
+            seed=params["seed"],
         )
         filtered = bandpass_filter(detrend_signal(raw_signal), params["fs_hz"])
 
-        estimators = {"Welch (widmo mocy)": estimate_hr_welch, "find_peaks (dziedzina czasu)": estimate_hr_peaks}
+        estimators = {
+            "Welch (widmo mocy)": estimate_hr_welch,
+            "find_peaks (dziedzina czasu)": estimate_hr_peaks,
+        }
         for name, estimator_fn in estimators.items():
             try:
                 estimated_bpm = estimator_fn(filtered, params["fs_hz"])
@@ -75,7 +83,8 @@ def run_estimate_test() -> dict:
             except Exception as exc:  # noqa: BLE001
                 rows.append((name, params["hr_bpm"], None, None, f"ERROR: {exc}"))
     except Exception as exc:  # noqa: BLE001 - awaria przygotowania sygnału (detrend/bandpass)
-        rows.append(("przygotowanie sygnału (detrend + bandpass)", params["hr_bpm"], None, None, f"ERROR: {exc}"))
+        stage_name = "przygotowanie sygnału (detrend + bandpass)"
+        rows.append((stage_name, params["hr_bpm"], None, None, f"ERROR: {exc}"))
 
     return {"params": params, "rows": rows}
 
@@ -91,21 +100,23 @@ def run_validate_test() -> dict:
     }
 
     try:
-        reference_clean, estimated_noisy = _generate_two_stage_pulse(
+        reference_clean, estimated_noisy = generate_two_stage_pulse(
             fs=30.0, duration_s=40.0, hr_bpm_stage1=65.0, hr_bpm_stage2=85.0, noise_std=0.2, seed=1
         )
         n_samples = estimated_noisy.shape[0]
         valid_vector = np.ones(n_samples, dtype=bool)
         valid_vector[300:600] = False  # symulacja 10 s utraty ROI, tak jak w validate.py
 
-        result = validate_signal(estimated_noisy, reference_clean, params["fs_hz"], valid=valid_vector)
-        status = "OK" if not np.isnan(result["mae_bpm"]) and not np.isnan(result["rmse_bpm"]) else "FAIL"
+        result = validate_signal(
+            estimated_noisy, reference_clean, params["fs_hz"], valid=valid_vector
+        )
+        mae_ok = not np.isnan(result["mae_bpm"]) and not np.isnan(result["rmse_bpm"])
         outcome = {
             "mae_bpm": result["mae_bpm"],
             "rmse_bpm": result["rmse_bpm"],
             "n_windows_total": result["n_windows_total"],
             "n_windows_used": result["n_windows_used"],
-            "status": status,
+            "status": "OK" if mae_ok else "FAIL",
         }
     except Exception as exc:  # noqa: BLE001
         outcome = {
@@ -129,7 +140,8 @@ def _fmt(value) -> str:
 
 def _params_table_rows(*named_params: tuple[str, dict]) -> list[str]:
     lines = [
-        "| Moduł | fs [Hz] | długość sygnału [s] | zadana częstość [BPM] | poziom szumu (std) | ziarno losowe |",
+        "| Moduł | fs [Hz] | długość sygnału [s] | zadana częstość [BPM] | "
+        "poziom szumu (std) | ziarno losowe |",
         "|---|---|---|---|---|---|",
     ]
     for module_name, params in named_params:
@@ -142,20 +154,25 @@ def _params_table_rows(*named_params: tuple[str, dict]) -> list[str]:
 
 def _hr_table(rows: list[tuple]) -> list[str]:
     lines = [
-        "| Metoda | Częstość referencyjna [BPM] | Częstość estymowana [BPM] | Błąd bezwzględny [BPM] | Status |",
+        "| Metoda | Częstość referencyjna [BPM] | Częstość estymowana [BPM] | "
+        "Błąd bezwzględny [BPM] | Status |",
         "|---|---|---|---|---|",
     ]
     for name, ref_bpm, est_bpm, err_bpm, status in rows:
-        lines.append(f"| {name} | {_fmt(ref_bpm)} | {_fmt(est_bpm)} | {_fmt(err_bpm)} | {status} |")
+        lines.append(
+            f"| {name} | {_fmt(ref_bpm)} | {_fmt(est_bpm)} | {_fmt(err_bpm)} | {status} |"
+        )
     return lines
 
 
-def build_report(timestamp: str, methods_result: dict, estimate_result: dict, validate_result: dict) -> str:
+def build_report(
+    timestamp: str, methods_result: dict, estimate_result: dict, validate_result: dict
+) -> str:
     lines = [
         "# Raport testów syntetycznych",
         "",
         f"Data uruchomienia: {timestamp}",
-        f"Tolerancja błędu HR: ±{TOLERANCE_BPM} BPM (jak w testach `__main__` poszczególnych modułów).",
+        f"Tolerancja błędu HR: ±{TOLERANCE_BPM} BPM (jak w testach pytest poszczególnych modułów).",
         "",
         "## Parametry testów",
         "",
@@ -180,7 +197,8 @@ def build_report(timestamp: str, methods_result: dict, estimate_result: dict, va
         f"| MAE [BPM] | {_fmt(validate_result['outcome']['mae_bpm'])} |",
         f"| RMSE [BPM] | {_fmt(validate_result['outcome']['rmse_bpm'])} |",
         f"| Liczba okien łącznie | {_fmt(validate_result['outcome']['n_windows_total'])} |",
-        f"| Liczba okien użytych w metrykach | {_fmt(validate_result['outcome']['n_windows_used'])} |",
+        f"| Liczba okien użytych w metrykach | "
+        f"{_fmt(validate_result['outcome']['n_windows_used'])} |",
         f"| Status | {validate_result['outcome']['status']} |",
         "",
     ]

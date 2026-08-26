@@ -4,7 +4,7 @@ Nie liczy niczego samodzielnie — wyłącznie wywołuje funkcje z `src/` w usta
 kolejności. Logika modułów nie jest jeszcze zaimplementowana (patrz src/).
 """
 
-from src import config, estimate, extract, io_layer, methods, roi, validate
+from src import config, estimate, extract, io_layer, methods, roi
 
 
 def run(subject_dir):

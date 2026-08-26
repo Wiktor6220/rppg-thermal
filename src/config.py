@@ -36,6 +36,14 @@ VALIDATION_STEP_SEC: float = 5.0  # krok przesuwanego okna (50% zakładki)
 # nigdy pojedyncze klatki (CLAUDE.md).
 MIN_VALID_RATIO: float = 0.5
 
+# --- Maska perfuzji z termiki (extract.py) ---
+
+# Piksel uznajemy za „wysokiej perfuzji", gdy jego temperatura (wartość
+# radiometryczna, bezwzględna) przekracza średnią ROI o `PERFUSION_TEMP_STD_FACTOR`
+# odchyleń standardowych liczonych w obrębie ROI. Próg względny wobec rozkładu ROI,
+# a nie normalizacja per klatka — pracujemy na temperaturze bezwzględnej (CLAUDE.md).
+PERFUSION_TEMP_STD_FACTOR: float = 0.5
+
 # --- Ścieżki ---
 
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
