@@ -13,6 +13,29 @@ FS: int = 30  # częstotliwość próbkowania klatek (Hz), wspólna dla RGB i te
 BAND_LOW_HZ: float = 0.7
 BAND_HIGH_HZ: float = 4.0
 
+# --- Detrending / filtracja / estymacja HR (estimate.py) ---
+
+# Parametr regularyzacji dla detrendingu metodą smoothness priors
+# (Tarvainen et al., 2002) — im większy, tym silniejsze tłumienie wolnych
+# składowych (silniejszy efekt górnoprzepustowy). Dobrany empirycznie dla FS=30.
+DETREND_LAMBDA: float = 300.0
+
+BUTTERWORTH_ORDER: int = 3  # rząd filtru pasmowoprzepustowego Butterwortha
+
+# Długość segmentu dla estymatora widma mocy (Welch), w sekundach —
+# spójna z długością okna walidacyjnego (10 s, patrz CONTEXT.md)
+WELCH_SEGMENT_SEC: float = 10.0
+
+# --- Walidacja (validate.py) ---
+
+VALIDATION_WINDOW_SEC: float = 10.0  # długość okna walidacyjnego (CONTEXT.md: "np. 10 s")
+VALIDATION_STEP_SEC: float = 5.0  # krok przesuwanego okna (50% zakładki)
+
+# Minimalny odsetek ważnych klatek w oknie (wg valid[]), poniżej którego okno
+# jest pomijane w metrykach — odrzucamy OKNA z przewagą nieważnych klatek,
+# nigdy pojedyncze klatki (CLAUDE.md).
+MIN_VALID_RATIO: float = 0.5
+
 # --- Ścieżki ---
 
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent

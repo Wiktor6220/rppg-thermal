@@ -18,9 +18,8 @@ def run(subject_dir):
 
     rppg_signal = methods.pos(rgb_trace, config.FS)
 
-    filtered_signal = estimate.bandpass_filter(
-        rppg_signal, config.FS, config.BAND_LOW_HZ, config.BAND_HIGH_HZ
-    )
+    detrended_signal = estimate.detrend_signal(rppg_signal)
+    filtered_signal = estimate.bandpass_filter(detrended_signal, config.FS)
     hr_bpm = estimate.estimate_hr_welch(filtered_signal, config.FS)
 
     return hr_bpm
