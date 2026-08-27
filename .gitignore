@@ -7,3 +7,4 @@ __pycache__/
 CLAUDE.md
 CONTEXT.md
 .claude/
+notebooks/
