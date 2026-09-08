@@ -8,7 +8,7 @@ Kontekst merytoryczny (cel pracy, architektura, decyzje) — patrz `CONTEXT.md`.
 - **Python 3.11**, zarządzane przez **uv**. Nigdy nie używaj `pip` bezpośrednio.
 - Instalacja zależności: `uv add <pakiet>`. Uruchamianie: `uv run python ...`, `uv run <cmd>`.
 - Zależności deklarowane w `pyproject.toml` — nie w kodzie, nie w osobnym pliku „wszystkie importy".
-- Platforma: MacBook M1 (arm64). mediapipe działa natywnie.
+- Platforma: MacBook Pro M1 (arm64). mediapipe działa natywnie.
 
 ## Struktura kodu
 

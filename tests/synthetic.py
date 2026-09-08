@@ -75,9 +75,9 @@ def generate_hard_synthetic_rgb(
     hrv_amplitude_bpm: float = 6.0,
     resp_freq_hz: float = 0.25,
     motion_amplitude: float = 0.05,
-    interference_amplitude: float = 0.02,
+    interference_amplitude: float = 0.03,
     interference_freq_hz: float = 1.6,
-    pulse_amplitude: float = 0.01,
+    pulse_amplitude: float = 0.02,
     noise_std: float = 0.5,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -94,6 +94,13 @@ def generate_hard_synthetic_rgb(
       - pulsacja o sygnaturze chrominancji (różne wagi per kanał, zielony najsilniejszy)
         — dzięki różnym wagom przeżywa projekcję CHROM/POS,
       - regulowany SNR przez `pulse_amplitude` (siła pulsu) i `noise_std` (szum).
+
+    Dobór amplitud jest celowy: `interference_amplitude` > `pulse_amplitude` (w kanale
+    zielonym pulsu i artefaktu wagi są ~1, więc artefakt dominuje) — dlatego GREEN
+    „przykleja się" do częstości artefaktu. Jednocześnie `pulse_amplitude` jest na tyle
+    duże, że po odrzuceniu artefaktu przez CHROM/POS puls pozostaje odzyskiwalny w
+    szerokim zakresie `noise_std` (rozpad w czystym szumie następuje dopiero przy
+    bardzo wysokim szumie).
 
     Zwraca (rgb_trace (N, 3), t). Pulsacja jest multiplikatywna względem DC, więc
     normalizacja po osi czasu (a nie per klatka) zachowuje kształt tętna.
