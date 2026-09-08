@@ -4,7 +4,7 @@ results/
 __pycache__/
 *.pyc
 .cloude
-CLAUDE.md
 CONTEXT.md
+CLAUDE.md
 .claude/
 notebooks/
