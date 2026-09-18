@@ -82,6 +82,21 @@ class LoadedRecording:
         """Generator klatek strumienia termicznego (podgląd wizualny) (H, W, 3), uint8."""
         return iter_video_frames(self.recording.thermal_path, to_rgb=to_rgb)
 
+    def synced_pairs(
+        self,
+        reference: str = "rgb",
+        match_resolution: str | None = None,
+        to_rgb: bool = True,
+    ) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
+        """Generator par (rgb_frame, thermal_frame, t_seconds) zsynchronizowanych w CZASIE.
+
+        Cienki wrapper na `iter_time_synced_pairs` — patrz tam po pełny opis parametrów
+        i semantykę odniesienia czasu.
+        """
+        return iter_time_synced_pairs(
+            self, reference=reference, match_resolution=match_resolution, to_rgb=to_rgb
+        )
+
 
 def _find_stream(session_dir: Path, suffix: str) -> Path | None:
     """Znajduje w folderze sesji plik wideo o zadanym sufiksie (np. `_rgb`, `_thermal`).
@@ -237,6 +252,122 @@ def load_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Lo
         recording=rec,
         rgb_meta=probe_video(rec.rgb_path),
         thermal_meta=probe_video(rec.thermal_path),
+    )
+
+
+def resize_to(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Przeskalowuje klatkę do zadanego rozmiaru `(width, height)` przez `cv2.resize`.
+
+    UWAGA: to jest wyłącznie ZGRUBNE przeskalowanie rozdzielczości (dopasowanie liczby
+    pikseli), a NIE korejestracja obrazów ani korekcja paralaksy. Piksele RGB i termiki
+    nadal NIE są geometrycznie dopasowane — właściwe zestrojenie (warping, paralaksa)
+    to osobny moduł (rozdz. 4.4). Używać tylko do wstępnego podglądu / wspólnego rozmiaru.
+    """
+    target_w, target_h = size
+    src_h, src_w = frame.shape[:2]
+    if (src_w, src_h) == (target_w, target_h):
+        return frame
+    # Zmniejszanie → INTER_AREA (mniej aliasingu); powiększanie → INTER_LINEAR.
+    interpolation = cv2.INTER_AREA if target_w * target_h < src_w * src_h else cv2.INTER_LINEAR
+    return cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
+
+
+def iter_time_synced_pairs(
+    loaded: LoadedRecording,
+    reference: str = "rgb",
+    match_resolution: str | None = None,
+    to_rgb: bool = True,
+) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
+    """Generator par klatek zsynchronizowanych w CZASIE (nie po numerze klatki).
+
+    RGB (≈29.97 fps) i termika (30.000 fps) mają różny fps i różną liczbę klatek, więc
+    parowanie po indeksie byłoby błędne. Zamiast tego jeden strumień jest ODNIESIENIEM
+    CZASU: iterujemy jego klatki, a dla każdej (czas `t = i / fps_ref`) dobieramy klatkę
+    drugiego strumienia NAJBLIŻSZĄ w czasie (indeks `j` minimalizujący `|j/fps_other - t|`).
+    Oba strumienie czytane są do przodu (bez losowego seekowania), więc pozostaje leniwo.
+
+    Zwraca krotki `(rgb_frame, thermal_frame, t_seconds)` — kolejność rgb/thermal jest
+    stała niezależnie od `reference`, a `t_seconds` to czas KLATKI ODNIESIENIA.
+
+    Args:
+        loaded: wynik `load_recording` (metadane obu strumieni + ścieżki).
+        reference: który strumień wyznacza oś czasu — "rgb" (domyślnie) lub "thermal".
+        match_resolution: opcjonalne zgrubne ujednolicenie rozdzielczości:
+            None  — bez skalowania (klatki w natywnych rozmiarach),
+            "rgb" — przeskaluj termikę do rozmiaru RGB,
+            "thermal" — przeskaluj RGB do rozmiaru termiki.
+            To tylko resize (patrz `resize_to`), NIE korejestracja/paralaksa (rozdz. 4.4).
+        to_rgb: konwersja klatek BGR→RGB (jak w `iter_video_frames`).
+
+    Yields:
+        `(rgb_frame, thermal_frame, t_seconds)` — klatki (H, W, 3) uint8 i czas [s].
+
+    Raises:
+        ValueError: gdy `reference`/`match_resolution` mają złą wartość lub fps ≤ 0.
+    """
+    if reference not in ("rgb", "thermal"):
+        raise ValueError(f"reference musi być 'rgb' albo 'thermal', otrzymano {reference!r}")
+    rgb_meta, thermal_meta = loaded.rgb_meta, loaded.thermal_meta
+    if rgb_meta.fps <= 0 or thermal_meta.fps <= 0:
+        raise ValueError("Nieznane fps (≤0) — nie można synchronizować w czasie.")
+    target_size = _resolve_target_size(match_resolution, rgb_meta, thermal_meta)
+
+    if reference == "rgb":
+        ref_meta, other_meta = rgb_meta, thermal_meta
+    else:
+        ref_meta, other_meta = thermal_meta, rgb_meta
+    ref_fps, other_fps = ref_meta.fps, other_meta.fps
+
+    ref_gen = iter_video_frames(ref_meta.path, to_rgb=to_rgb)
+    other_gen = iter_video_frames(other_meta.path, to_rgb=to_rgb)
+    try:
+        try:
+            current_other = next(other_gen)
+        except StopIteration:
+            return  # drugi strumień pusty — nie ma czego parować
+        j = 0
+        for i, ref_frame in enumerate(ref_gen):
+            t_ref = i / ref_fps
+            # Przesuwaj drugi strumień do przodu, dopóki NASTĘPNA klatka jest bliżej w czasie.
+            while abs((j + 1) / other_fps - t_ref) <= abs(j / other_fps - t_ref):
+                try:
+                    current_other = next(other_gen)
+                except StopIteration:
+                    break
+                j += 1
+
+            if reference == "rgb":
+                rgb_frame, thermal_frame = ref_frame, current_other
+            else:
+                rgb_frame, thermal_frame = current_other, ref_frame
+
+            if match_resolution == "rgb":
+                thermal_frame = resize_to(thermal_frame, target_size)  # termika → rozmiar RGB
+            elif match_resolution == "thermal":
+                rgb_frame = resize_to(rgb_frame, target_size)  # RGB → rozmiar termiki
+
+            yield rgb_frame, thermal_frame, t_ref
+    finally:
+        # Zwolnij oba VideoCapture od razu (nie czekaj na GC). iter_video_frames zwraca
+        # generator, więc ma .close() — sięgamy przez getattr, bo typ zwrotny to Iterator.
+        for gen in (ref_gen, other_gen):
+            close = getattr(gen, "close", None)
+            if callable(close):
+                close()
+
+
+def _resolve_target_size(
+    match_resolution: str | None, rgb_meta: VideoMeta, thermal_meta: VideoMeta
+) -> tuple[int, int]:
+    """Zwraca docelowy rozmiar (width, height) dla `match_resolution` (lub (0,0), gdy None)."""
+    if match_resolution is None:
+        return (0, 0)  # nieużywane
+    if match_resolution == "rgb":
+        return rgb_meta.resolution
+    if match_resolution == "thermal":
+        return thermal_meta.resolution
+    raise ValueError(
+        f"match_resolution musi być None, 'rgb' albo 'thermal', otrzymano {match_resolution!r}"
     )
 
 

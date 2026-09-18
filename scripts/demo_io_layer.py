@@ -56,6 +56,25 @@ def main() -> None:
     print(f"  klatki       : {rgb.frame_count} vs {thermal.frame_count} "
           f"(różnica {abs(rgb.frame_count - thermal.frame_count)})")
 
+    print("\nPary klatek zsynchronizowane w CZASIE (odniesienie: RGB, natywne rozmiary):")
+    pairs = loaded.synced_pairs(reference="rgb")
+    for k, (rgb_frame, thermal_frame, t_seconds) in enumerate(pairs):
+        if k >= 5:
+            break
+        print(f"  para {k}: t={t_seconds:.3f} s  "
+              f"rgb={rgb_frame.shape}  thermal={thermal_frame.shape}")
+    pairs.close()
+
+    print("\nTe same pary z termiką przeskalowaną do rozmiaru RGB "
+          "(zgrubny resize, NIE korejestracja/paralaksa):")
+    pairs_matched = loaded.synced_pairs(reference="rgb", match_resolution="rgb")
+    for k, (rgb_frame, thermal_frame, t_seconds) in enumerate(pairs_matched):
+        if k >= 3:
+            break
+        print(f"  para {k}: t={t_seconds:.3f} s  "
+              f"rgb={rgb_frame.shape}  thermal={thermal_frame.shape}")
+    pairs_matched.close()
+
 
 if __name__ == "__main__":
     main()
