@@ -130,7 +130,6 @@ def main() -> None:
     parser.add_argument("--subject", default="subject01")
     parser.add_argument("--scenario", default="s1_rest_rest")
     parser.add_argument("--num-preview", type=int, default=16)
-    parser.add_argument("--crop-size", type=int, default=1600, help="bok wycinka detekcji [px]")
     args = parser.parse_args()
 
     loaded = load_recording(args.subject, args.scenario)
@@ -139,7 +138,7 @@ def main() -> None:
     orig_width = meta.resolution[0]
     print(f"Nagranie: {rec.subject}/{rec.scenario}  ({rec.rgb_path.name})")
     print(f"  {n_frames} klatek, {fps:.3f} fps, {orig_width}x{meta.resolution[1]}")
-    print(f"  regiony ROI: {REGIONS};  wycinek detekcji: {args.crop_size}px")
+    print(f"  regiony ROI: {REGIONS};  wycinek detekcji: wieloskalowy adaptacyjny")
 
     sample_indices = set(np.linspace(0, max(0, n_frames - 1), args.num_preview, dtype=int).tolist())
     stash: dict[int, np.ndarray] = {}
@@ -151,7 +150,7 @@ def main() -> None:
                 stash[i] = frame.copy()  # pełna rozdzielczość — kadr na twarz zrobimy po detekcji
             yield frame
 
-    detector = make_cropping_detector(crop_size=args.crop_size)
+    detector = make_cropping_detector()  # wielkoskalowy adaptacyjny wycinek
     print("\nDetekcja + śledzenie (może chwilę potrwać na pełnym nagraniu)...")
     roi_positions, valid = track_roi_across_frames(
         tee(loaded.rgb_frames(to_rgb=True)),

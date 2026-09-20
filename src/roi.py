@@ -101,48 +101,57 @@ def make_facemesh_detector(
 
 
 def make_cropping_detector(
-    crop_size: int = 1600, reacquire_from_center: bool = True
+    crop_sizes: tuple[int, ...] = (1000, 1300, 700, 1600),
+    reacquire_from_center: bool = True,
 ) -> Callable[[np.ndarray], np.ndarray | None]:
     """Buduje detektor „detekcja na wykadrowanym obszarze twarzy", odporny na małą twarz.
 
-    Na nagraniach z drona twarz zajmuje ~6% szerokości kadru 4K; wewnętrzny detektor
+    Na nagraniach z drona twarz zajmuje kilka % szerokości kadru 4K; wewnętrzny detektor
     FaceLandmarker skaluje CAŁY obraz do ~192 px, więc tak mała twarz ginie i detekcja
     na pełnej klatce zawodzi. Rozwiązanie: utrzymuj środek ostatnio znalezionej twarzy
-    i wykrywaj na kwadratowym wycinku `crop_size` wokół niego (twarz staje się dużo
-    większą częścią kadru), a punkty mapuj z powrotem do współrzędnych ORYGINAŁU.
+    i wykrywaj na kwadratowym wycinku wokół niego (twarz staje się dużo większą częścią
+    kadru), a punkty mapuj z powrotem do współrzędnych ORYGINAŁU.
 
-    Detektor jest stanowy (pamięta środek między klatkami) — twórz osobną instancję na
-    nagranie. Przy utracie detekcji środek jest resetowany do centrum kadru (reakwizycja).
+    Rozmiar twarzy zależy od dystansu (osoba dalej → mniejsza twarz → potrzebny CIAŚNIEJSZY
+    wycinek). Dlatego próbujemy kilku rozmiarów `crop_sizes` w kolejności, zaczynając od
+    ostatnio skutecznego; pierwszy z detekcją wygrywa. Detektor jest stanowy (pamięta
+    środek i skalę między klatkami) — twórz osobną instancję na nagranie. Przy całkowitej
+    utracie środek jest resetowany do centrum kadru (reakwizycja).
 
     Args:
-        crop_size: bok kwadratowego wycinka w pikselach oryginału.
+        crop_sizes: boki kwadratowych wycinków (px oryginału) próbowane w kolejności.
         reacquire_from_center: przy braku detekcji wróć do środka kadru na następną próbę.
 
     Returns:
         Funkcja klatka -> landmarki (K, 2) we współrzędnych oryginału albo None.
     """
-    state: dict[str, float | None] = {"cx": None, "cy": None}
+    state: dict[str, float | int | None] = {"cx": None, "cy": None, "size_idx": 0}
 
     def detector(frame: np.ndarray) -> np.ndarray | None:
         height, width = frame.shape[:2]
         center_x = state["cx"] if state["cx"] is not None else width / 2.0
         center_y = state["cy"] if state["cy"] is not None else height / 2.0
 
-        half = crop_size // 2
-        x0 = int(np.clip(center_x - half, 0, max(0, width - crop_size)))
-        y0 = int(np.clip(center_y - half, 0, max(0, height - crop_size)))
-        crop = np.ascontiguousarray(frame[y0 : y0 + crop_size, x0 : x0 + crop_size])
+        last_idx = int(state["size_idx"] or 0)
+        order = [last_idx] + [k for k in range(len(crop_sizes)) if k != last_idx]
+        for k in order:
+            size = crop_sizes[k]
+            half = size // 2
+            x0 = int(np.clip(center_x - half, 0, max(0, width - size)))
+            y0 = int(np.clip(center_y - half, 0, max(0, height - size)))
+            crop = np.ascontiguousarray(frame[y0 : y0 + size, x0 : x0 + size])
 
-        points = detect_face_landmarks(crop)
-        if points is None:
-            if reacquire_from_center:
-                state["cx"], state["cy"] = None, None
-            return None
+            points = detect_face_landmarks(crop)
+            if points is not None:
+                points_full = points + np.array([x0, y0], dtype=np.float64)  # -> oryginał
+                state["cx"] = float(points_full[:, 0].mean())
+                state["cy"] = float(points_full[:, 1].mean())
+                state["size_idx"] = k
+                return points_full
 
-        points_full = points + np.array([x0, y0], dtype=np.float64)  # -> współrzędne oryginału
-        state["cx"] = float(points_full[:, 0].mean())
-        state["cy"] = float(points_full[:, 1].mean())
-        return points_full
+        if reacquire_from_center:
+            state["cx"], state["cy"] = None, None
+        return None
 
     return detector
 
