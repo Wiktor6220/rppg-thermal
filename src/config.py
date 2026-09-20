@@ -49,8 +49,23 @@ PERFUSION_TEMP_STD_FACTOR: float = 0.5
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = ROOT_DIR / "data"
 RESULTS_DIR: Path = ROOT_DIR / "results"
+MODELS_DIR: Path = ROOT_DIR / "models"
 
-# --- Indeksy landmarków MediaPipe Face Mesh (do zdefiniowania ROI) ---
+# Model MediaPipe Tasks FaceLandmarker (.task) — pobierany osobno (poza gitem), bo
+# ten build mediapipe nie dostarcza offline `solutions.face_mesh` ani modelu w paczce.
+# Pobranie: storage.googleapis.com/mediapipe-models/face_landmarker/.../face_landmarker.task
+FACE_LANDMARKER_MODEL_PATH: Path = MODELS_DIR / "face_landmarker.task"
 
-# TODO: uzupełnić konkretnymi indeksami po wyborze ROI (czoło, policzki) w roi.py
-FACE_MESH_LANDMARK_INDICES: dict[str, list[int]] = {}
+# --- Indeksy landmarków MediaPipe Face Mesh (siatka 468 punktów, bez iris) ---
+
+# Kuratorowane klastry punktów wyznaczające ROI wysokiej perfuzji (czoło, policzki).
+# Indeksy w zakresie 0..467 (refine_landmarks=False). ROI liczymy jako bounding box
+# obejmujący dany klaster. Zestawy są przybliżone i można je doprecyzować po podglądzie.
+FACE_MESH_LANDMARK_INDICES: dict[str, list[int]] = {
+    # Czoło: od linii brwi (66/296, 107/336) w górę do czubka (10), boki (67/297).
+    "forehead": [10, 67, 69, 66, 107, 108, 109, 151, 337, 338, 297, 299, 296, 336],
+    # Policzek lewy (strona obrazu): od okolic nosa (50) po środek policzka (205).
+    "left_cheek": [50, 101, 118, 117, 116, 123, 147, 187, 205, 36, 142],
+    # Policzek prawy (strona obrazu), lustrzane odpowiedniki punktów lewego.
+    "right_cheek": [280, 330, 347, 346, 345, 352, 376, 411, 425, 266, 371],
+}

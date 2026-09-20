@@ -3,37 +3,177 @@
 Zasada „nigdy nie usuwaj klatki": gdy ROI nie zostanie znalezione, pozycja jest
 przytrzymywana z poprzedniej klatki lub interpolowana, a klatka oznaczana jako
 nieważna w wektorze `valid[]`. Odrzucane są okna, nie pojedyncze klatki.
+
+MediaPipe importowany jest leniwie (dopiero przy pierwszej realnej detekcji), aby
+import modułu i testy jednostkowe (atrapa detektora) pozostały szybkie.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
+import cv2
 import numpy as np
+
+from src.config import FACE_LANDMARKER_MODEL_PATH, FACE_MESH_LANDMARK_INDICES
+
+_FACE_LANDMARKER = None  # singleton MediaPipe Tasks FaceLandmarker (tworzony leniwie)
+
+
+def _get_face_landmarker():
+    """Zwraca współdzieloną instancję FaceLandmarker (Tasks API), tworzoną przy 1. użyciu.
+
+    Ten build mediapipe udostępnia tylko API Tasks (brak `solutions.face_mesh`), więc
+    detekcja wymaga pliku modelu `.task` (patrz `config.FACE_LANDMARKER_MODEL_PATH`).
+    Tryb IMAGE = każda klatka niezależnie (uczciwa miara pokrycia detekcji).
+    """
+    global _FACE_LANDMARKER
+    if _FACE_LANDMARKER is None:
+        if not FACE_LANDMARKER_MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"Brak modelu FaceLandmarker: {FACE_LANDMARKER_MODEL_PATH}. "
+                "Pobierz face_landmarker.task do models/ (patrz komentarz w config.py)."
+            )
+        from mediapipe.tasks import python as mp_python  # leniwy import — ciężka biblioteka
+        from mediapipe.tasks.python import vision
+
+        options = vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(FACE_LANDMARKER_MODEL_PATH)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+        )
+        _FACE_LANDMARKER = vision.FaceLandmarker.create_from_options(options)
+    return _FACE_LANDMARKER
 
 
 def detect_face_landmarks(frame: np.ndarray) -> np.ndarray | None:
-    """Wykrywa punkty charakterystyczne twarzy (Face Mesh) na pojedynczej klatce RGB.
+    """Wykrywa punkty charakterystyczne twarzy (FaceLandmarker) na pojedynczej klatce RGB.
 
     Args:
-        frame: pojedyncza klatka obrazu RGB o kształcie (H, W, 3).
+        frame: pojedyncza klatka obrazu RGB (H, W, 3), uint8 (ciągła w pamięci).
 
     Returns:
-        Tablica punktów charakterystycznych (N, 2) w pikselach, albo None, gdy twarz
-        nie została wykryta na klatce.
+        Tablica (K, 2) punktów [x, y] w pikselach danej klatki (K=478 dla tego modelu;
+        indeksy ROI z config są <468), albo None, gdy twarz nie została wykryta.
     """
-    raise NotImplementedError
+    import mediapipe as mp
+
+    landmarker = _get_face_landmarker()
+    rgb = np.ascontiguousarray(frame, dtype=np.uint8)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = landmarker.detect(mp_image)
+    if not result.face_landmarks:
+        return None
+
+    height, width = frame.shape[:2]
+    landmarks = result.face_landmarks[0]
+    return np.array([[lm.x * width, lm.y * height] for lm in landmarks], dtype=np.float64)
+
+
+def make_facemesh_detector(
+    detection_width: int = 640,
+) -> Callable[[np.ndarray], np.ndarray | None]:
+    """Buduje detektor, który wykrywa na pomniejszonej klatce, ale zwraca punkty w oryginale.
+
+    Klatki 4K są duże — detekcja na zmniejszonej kopii (`detection_width`) jest znacznie
+    szybsza, a landmarki są przeskalowywane z powrotem do współrzędnych ORYGINAŁU, więc
+    ROI liczone jest na pełnej rozdzielczości.
+
+    Args:
+        detection_width: docelowa szerokość klatki do detekcji (0 = bez zmniejszania).
+
+    Returns:
+        Funkcja klatka -> landmarki (468, 2) w oryginalnych współrzędnych albo None.
+    """
+
+    def detector(frame: np.ndarray) -> np.ndarray | None:
+        height, width = frame.shape[:2]
+        if detection_width and width > detection_width:
+            scale = detection_width / width
+            small = cv2.resize(
+                frame,
+                (detection_width, max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+            points = detect_face_landmarks(small)
+            return None if points is None else points / scale  # -> współrzędne oryginału
+        return detect_face_landmarks(frame)
+
+    return detector
+
+
+def make_cropping_detector(
+    crop_size: int = 1600, reacquire_from_center: bool = True
+) -> Callable[[np.ndarray], np.ndarray | None]:
+    """Buduje detektor „detekcja na wykadrowanym obszarze twarzy", odporny na małą twarz.
+
+    Na nagraniach z drona twarz zajmuje ~6% szerokości kadru 4K; wewnętrzny detektor
+    FaceLandmarker skaluje CAŁY obraz do ~192 px, więc tak mała twarz ginie i detekcja
+    na pełnej klatce zawodzi. Rozwiązanie: utrzymuj środek ostatnio znalezionej twarzy
+    i wykrywaj na kwadratowym wycinku `crop_size` wokół niego (twarz staje się dużo
+    większą częścią kadru), a punkty mapuj z powrotem do współrzędnych ORYGINAŁU.
+
+    Detektor jest stanowy (pamięta środek między klatkami) — twórz osobną instancję na
+    nagranie. Przy utracie detekcji środek jest resetowany do centrum kadru (reakwizycja).
+
+    Args:
+        crop_size: bok kwadratowego wycinka w pikselach oryginału.
+        reacquire_from_center: przy braku detekcji wróć do środka kadru na następną próbę.
+
+    Returns:
+        Funkcja klatka -> landmarki (K, 2) we współrzędnych oryginału albo None.
+    """
+    state: dict[str, float | None] = {"cx": None, "cy": None}
+
+    def detector(frame: np.ndarray) -> np.ndarray | None:
+        height, width = frame.shape[:2]
+        center_x = state["cx"] if state["cx"] is not None else width / 2.0
+        center_y = state["cy"] if state["cy"] is not None else height / 2.0
+
+        half = crop_size // 2
+        x0 = int(np.clip(center_x - half, 0, max(0, width - crop_size)))
+        y0 = int(np.clip(center_y - half, 0, max(0, height - crop_size)))
+        crop = np.ascontiguousarray(frame[y0 : y0 + crop_size, x0 : x0 + crop_size])
+
+        points = detect_face_landmarks(crop)
+        if points is None:
+            if reacquire_from_center:
+                state["cx"], state["cy"] = None, None
+            return None
+
+        points_full = points + np.array([x0, y0], dtype=np.float64)  # -> współrzędne oryginału
+        state["cx"] = float(points_full[:, 0].mean())
+        state["cy"] = float(points_full[:, 1].mean())
+        return points_full
+
+    return detector
 
 
 def select_roi_from_landmarks(landmarks: np.ndarray, region: str) -> np.ndarray:
-    """Wyznacza maskę lub bounding box ROI na podstawie punktów charakterystycznych.
+    """Wyznacza bounding box ROI dla danego regionu na podstawie punktów charakterystycznych.
+
+    Region to jeden z kluczy `config.FACE_MESH_LANDMARK_INDICES` (np. "forehead",
+    "left_cheek", "right_cheek"). ROI zwracane jest jako bbox `[y0, x0, y1, x1]`
+    (spójnie z `extract._roi_to_mask`), obejmujący klaster punktów regionu.
 
     Args:
-        landmarks: punkty charakterystyczne twarzy (N, 2), wynik `detect_face_landmarks`.
-        region: nazwa obszaru ROI (np. "forehead", "cheeks") zdefiniowana w config.py.
+        landmarks: punkty charakterystyczne twarzy (468, 2) [x, y], wynik detekcji.
+        region: nazwa regionu ROI z `config.FACE_MESH_LANDMARK_INDICES`.
 
     Returns:
-        Maska binarna ROI o kształcie (H, W) lub współrzędne bounding boxa.
+        Bounding box `[y0, x0, y1, x1]` (int), z dolną granicą przyciętą do 0.
+
+    Raises:
+        ValueError: gdy `region` nie występuje w konfiguracji.
     """
-    raise NotImplementedError
+    if region not in FACE_MESH_LANDMARK_INDICES:
+        raise ValueError(
+            f"Nieznany region ROI: {region!r}. Dostępne: {list(FACE_MESH_LANDMARK_INDICES)}"
+        )
+    points = landmarks[FACE_MESH_LANDMARK_INDICES[region]]
+    x0 = max(0, int(np.floor(points[:, 0].min())))
+    y0 = max(0, int(np.floor(points[:, 1].min())))
+    x1 = int(np.ceil(points[:, 0].max()))
+    y1 = int(np.ceil(points[:, 1].max()))
+    return np.array([y0, x0, y1, x1], dtype=int)
 
 
 def _fill_missing_roi(
@@ -65,7 +205,7 @@ def _fill_missing_roi(
 
 
 def track_roi_across_frames(
-    frames: np.ndarray,
+    frames: Iterable[np.ndarray],
     detector: Callable[[np.ndarray], np.ndarray | None] = detect_face_landmarks,
     roi_builder: Callable[[np.ndarray, str], np.ndarray] = select_roi_from_landmarks,
     region: str = "forehead",
@@ -78,8 +218,11 @@ def track_roi_across_frames(
     uruchamiania MediaPipe. Przy braku detekcji ROI na danej klatce: przytrzymuje
     ostatnią znaną pozycję (luki wiodące — pierwsza znana), nigdy nie usuwa klatki.
 
+    Klatki są konsumowane leniwie (iterowalne), więc można podać generator z io_layer
+    i nie materializować całego (dużego, 4K) wideo w pamięci.
+
     Args:
-        frames: sekwencja klatek RGB o kształcie (N, H, W, 3).
+        frames: iterowalne klatek RGB (H, W, 3) — np. generator z `io_layer`.
         detector: funkcja klatka -> landmarki (N, 2) lub None przy braku detekcji.
         roi_builder: funkcja (landmarki, region) -> maska/bbox ROI.
         region: nazwa obszaru ROI przekazywana do `roi_builder`.
@@ -91,15 +234,17 @@ def track_roi_across_frames(
             valid: 1D tablica bool długości N — True, gdy ROI pochodzi z faktycznej
                 detekcji, False, gdy zostało przytrzymane/uzupełnione.
     """
-    n_frames = len(frames)
-    raw_roi: list[np.ndarray | None] = [None] * n_frames
-    valid = np.zeros(n_frames, dtype=bool)
-
-    for i in range(n_frames):
-        landmarks = detector(frames[i])
+    raw_roi: list[np.ndarray | None] = []
+    valid_list: list[bool] = []
+    for frame in frames:
+        landmarks = detector(frame)
         if landmarks is not None:
-            raw_roi[i] = roi_builder(landmarks, region)
-            valid[i] = True
+            raw_roi.append(roi_builder(landmarks, region))
+            valid_list.append(True)
+        else:
+            raw_roi.append(None)
+            valid_list.append(False)
 
+    valid = np.array(valid_list, dtype=bool)
     roi_positions = _fill_missing_roi(raw_roi, valid)
     return roi_positions, valid
