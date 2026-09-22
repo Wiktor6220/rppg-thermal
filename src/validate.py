@@ -230,3 +230,67 @@ def validate_signal(
         "mae_bpm": metrics["mae_bpm"],
         "rmse_bpm": metrics["rmse_bpm"],
     }
+
+
+def validate_against_hr_series(
+    estimated_signal: np.ndarray,
+    fs: float,
+    ref_t_s: np.ndarray,
+    ref_hr_bpm: np.ndarray,
+    valid: np.ndarray | None = None,
+    window_s: float = VALIDATION_WINDOW_SEC,
+    step_s: float = VALIDATION_STEP_SEC,
+    min_valid_ratio: float = MIN_VALID_RATIO,
+    hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
+) -> dict:
+    """Waliduje rPPG względem rzadkiej serii HR (np. Polar ~1 Hz) w oknach 10 s.
+
+    W każdym oknie: HR z Welcha na sygnale rPPG oraz średnia próbek Polar, których
+    czas wypada w ``[t0, t0+window_s)``. Okna bez próbek Polar albo z niskim
+    ``valid[]`` są pomijane (NaN).
+    """
+    estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
+    ref_t_s = np.asarray(ref_t_s, dtype=np.float64)
+    ref_hr_bpm = np.asarray(ref_hr_bpm, dtype=np.float64)
+    n_samples = estimated_signal.shape[0]
+
+    if valid is None:
+        valid = np.ones(n_samples, dtype=bool)
+    valid = np.asarray(valid, dtype=bool)
+    if valid.shape[0] != n_samples:
+        raise ValueError("Wektor valid[] musi mieć tę samą długość co sygnał.")
+
+    bounds = _window_bounds(n_samples, fs, window_s, step_s)
+    n_windows = len(bounds)
+    window_start_s = np.array([start / fs for start, _ in bounds])
+    estimated_hr_bpm = np.full(n_windows, np.nan)
+    reference_hr_bpm = np.full(n_windows, np.nan)
+    window_used = np.zeros(n_windows, dtype=bool)
+
+    for i, (start, end) in enumerate(bounds):
+        if _window_valid_ratio(valid, start, end) < min_valid_ratio:
+            continue
+        t0 = start / fs
+        t1 = end / fs
+        in_win = (ref_t_s >= t0) & (ref_t_s < t1)
+        if not np.any(in_win):
+            continue
+        est_hr = _estimate_window_hr(estimated_signal[start:end], fs, hr_estimator)
+        ref_hr = float(np.mean(ref_hr_bpm[in_win]))
+        estimated_hr_bpm[i] = est_hr
+        reference_hr_bpm[i] = ref_hr
+        window_used[i] = not np.isnan(est_hr)
+
+    error_bpm = np.abs(estimated_hr_bpm - reference_hr_bpm)
+    metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
+    return {
+        "window_start_s": window_start_s,
+        "estimated_hr_bpm": estimated_hr_bpm,
+        "reference_hr_bpm": reference_hr_bpm,
+        "error_bpm": error_bpm,
+        "window_used": window_used,
+        "n_windows_total": n_windows,
+        "n_windows_used": metrics["n_windows_used"],
+        "mae_bpm": metrics["mae_bpm"],
+        "rmse_bpm": metrics["rmse_bpm"],
+    }

@@ -1,8 +1,12 @@
 """scripts/demo_pipeline_rgb_thermal.py — porównanie RGB vs RGB+termika.
 
-Bez referencji EKG/Polar. Dla każdego regionu ROI:
+Dla każdego regionu ROI:
   plain  = średnie RGB w bboxie,
-  gated  = średnie RGB w bboxie ∩ masce perfuzji (termika przez odwrotną affine).
+  gated  = średnie RGB w bboxie ∩ masce perfuzji (termika przez odwrotną affine);
+           przy masce < PERFUSION_MIN_ROI_FRAC ROI → fallback do plain.
+Region ``cheeks`` = średnia śladów left/right (bez nosa/ust); w tabeli tylko forehead + cheeks.
+
+Gdy jest ``*_HR.csv`` (Polar): MAE/RMSE w oknach 10 s (krok 5 s) vs średnia Polar w oknie.
 
 Wyniki per nagranie: ``results/pipeline_rgb_thermal/<subject>/<scenario>/``
 Zbiorczo (``--all``): ``results/pipeline_rgb_thermal/summary_all.md`` (+ .csv).
@@ -39,24 +43,32 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.signal import welch  # noqa: E402
 
-from src import estimate, methods  # noqa: E402
+from src import estimate, methods, validate  # noqa: E402
 from src.config import (  # noqa: E402
+    AFFINE_EVERY_BY_SCENARIO,
+    AFFINE_EVERY_DEFAULT,
     BAND_HIGH_HZ,
     BAND_LOW_HZ,
+    PERFUSION_MIN_ROI_FRAC,
     PERFUSION_TEMP_STD_FACTOR,
     RESULTS_DIR,
 )
-from src.io_layer import list_recordings, load_recording  # noqa: E402
+from src.io_layer import list_recordings, load_polar_hr, load_recording  # noqa: E402
 from src.registration import (  # noqa: E402
     apply_affine,
     estimate_affine_thermal_to_rgb,
 )
 from src.roi import make_cropping_detector, select_roi_from_landmarks  # noqa: E402
 
-REGIONS = ["forehead", "left_cheek", "right_cheek"]
+REGIONS_EXTRACT = ["forehead", "left_cheek", "right_cheek"]
+REGIONS_REPORT = ["forehead", "cheeks"]  # L/R tylko wewnętrznie → średnia „cheeks”
 METHODS = {"CHROM": methods.chrom, "POS": methods.pos}
-AFFINE_EVERY = 30  # ~1 s przy 30 fps
 OUT_ROOT = RESULTS_DIR / "pipeline_rgb_thermal"
+
+
+def _affine_every(scenario: str) -> int:
+    """Interwał odświeżania affine: częściej przy ruchu / zmiennym dystansie."""
+    return AFFINE_EVERY_BY_SCENARIO.get(scenario, AFFINE_EVERY_DEFAULT)
 
 
 def _mute_native_stderr() -> None:
@@ -98,24 +110,9 @@ def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return mask
 
 
-def _cheeks_union_bbox(landmarks: np.ndarray) -> np.ndarray:
-    left = select_roi_from_landmarks(landmarks, "left_cheek")
-    right = select_roi_from_landmarks(landmarks, "right_cheek")
-    return np.array(
-        [
-            min(int(left[0]), int(right[0])),
-            min(int(left[1]), int(right[1])),
-            max(int(left[2]), int(right[2])),
-            max(int(left[3]), int(right[3])),
-        ],
-        dtype=int,
-    )
-
-
 def _region_boxes(landmarks: np.ndarray) -> dict[str, np.ndarray]:
-    boxes = {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS}
-    boxes["cheeks"] = _cheeks_union_bbox(landmarks)
-    return boxes
+    """Bboxy ROI do ekstrakcji: czoło + lewy/prawy policzek (bez nosa/ust)."""
+    return {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS_EXTRACT}
 
 
 def _mean_rgb(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -164,7 +161,9 @@ def _gated_mean_rgb(
     ).ravel()
     thr = float(temps.mean() + PERFUSION_TEMP_STD_FACTOR * temps.std())
     keep = temps >= thr
-    if not np.any(keep):
+    n_roi = int(inside.sum())
+    n_keep = int(np.count_nonzero(keep))
+    if n_roi == 0 or n_keep < PERFUSION_MIN_ROI_FRAC * n_roi:
         return _mean_rgb(rgb, roi_mask)
     return rgb[ys[inside][keep], xs[inside][keep]].mean(axis=0).astype(np.float64)
 
@@ -185,14 +184,15 @@ def run_one(subject: str, scenario: str) -> list[dict]:
     loaded = load_recording(subject, scenario)
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
+    affine_every = _affine_every(scenario)
     print(f"\n{'=' * 60}")
     print(f"Nagranie: {subject}/{scenario}  {n_frames} klatek @ {fs:.3f} fps")
-    print(f"Affine odświeżana co {AFFINE_EVERY} klatek")
+    print(f"Affine odświeżana co {affine_every} klatek")
 
     detector = make_cropping_detector()
-    all_regions = REGIONS + ["cheeks"]
-    plain_lists: dict[str, list] = {r: [] for r in all_regions}
-    gated_lists: dict[str, list] = {r: [] for r in all_regions}
+    # Ekstrakcja: forehead + L/R. Raport tylko: forehead + cheeks (= średnia L+R).
+    plain_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+    gated_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
     valid_list: list[bool] = []
 
     affine = None
@@ -207,7 +207,7 @@ def run_one(subject: str, scenario: str) -> list[dict]:
             boxes = _region_boxes(landmarks)
             last_boxes = boxes
             valid_list.append(True)
-            if affine is None or (i % AFFINE_EVERY == 0):
+            if affine is None or (i % affine_every == 0):
                 new_affine, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
                 if new_affine is not None:
                     affine = new_affine
@@ -222,14 +222,14 @@ def run_one(subject: str, scenario: str) -> list[dict]:
 
         if boxes is None:
             full = rgb.reshape(-1, 3).mean(axis=0)
-            for region in all_regions:
+            for region in REGIONS_EXTRACT:
                 plain_lists[region].append(full)
                 gated_lists[region].append(full)
             continue
 
         h, w = rgb.shape[:2]
         th_gray = _thermal_gray(thermal)
-        for region in all_regions:
+        for region in REGIONS_EXTRACT:
             roi_mask = _bbox_to_mask(boxes[region], (h, w))
             plain_lists[region].append(_mean_rgb(rgb, roi_mask))
             if affine is None:
@@ -243,12 +243,29 @@ def run_one(subject: str, scenario: str) -> list[dict]:
             print(f"  klatka {i + 1}/{n_frames}", flush=True)
 
     valid = np.array(valid_list, dtype=bool)
-    plain = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
-    gated = {r: np.asarray(v, dtype=np.float64) for r, v in gated_lists.items()}
+    plain_ex = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
+    gated_ex = {r: np.asarray(v, dtype=np.float64) for r, v in gated_lists.items()}
+    plain = {
+        "forehead": plain_ex["forehead"],
+        "cheeks": 0.5 * (plain_ex["left_cheek"] + plain_ex["right_cheek"]),
+    }
+    gated = {
+        "forehead": gated_ex["forehead"],
+        "cheeks": 0.5 * (gated_ex["left_cheek"] + gated_ex["right_cheek"]),
+    }
     print(
         f"Pokrycie detekcji: {100.0 * valid.mean():.1f}%  "
         f"({int(valid.sum())}/{valid.size}); affine OK/fail: {n_affine_ok}/{n_affine_fail}"
     )
+
+    polar = load_polar_hr(subject, scenario)
+    if polar is None:
+        print("Polar HR: brak pliku — pomijam MAE/RMSE okienne")
+    else:
+        print(
+            f"Polar HR: {len(polar.hr_bpm)} próbek, "
+            f"średnia {float(polar.hr_bpm.mean()):.1f} BPM (po skip kalibracji)"
+        )
 
     rows: list[dict] = []
     cleaned_store: dict[tuple[str, str, str], np.ndarray] = {}
@@ -257,13 +274,19 @@ def run_one(subject: str, scenario: str) -> list[dict]:
         f"{'HR plain':>10} {'HR gated':>10} {'ΔHR':>8} "
         f"{'SNR plain':>10} {'SNR gated':>10} {'ΔSNR':>8}"
     )
+    if polar is not None:
+        header += f" {'MAE_p':>8} {'MAE_g':>8}"
     print(header)
     print("-" * len(header))
 
-    for region in all_regions:
+    for region in REGIONS_REPORT:
         for name, method_fn in METHODS.items():
-            clean_p, hr_p = _process_signal(plain[region], fs, method_fn)
-            clean_g, hr_g = _process_signal(gated[region], fs, method_fn)
+            sig_p = method_fn(plain[region], fs)
+            sig_g = method_fn(gated[region], fs)
+            clean_p = estimate.bandpass_filter(estimate.detrend_signal(sig_p), fs)
+            clean_g = estimate.bandpass_filter(estimate.detrend_signal(sig_g), fs)
+            hr_p = estimate.estimate_hr_welch(clean_p, fs)
+            hr_g = estimate.estimate_hr_welch(clean_g, fs)
             snr_p = estimate.snr_rppg(clean_p, fs, hr_p)
             snr_g = estimate.snr_rppg(clean_g, fs, hr_p)
             row = {
@@ -277,34 +300,63 @@ def run_one(subject: str, scenario: str) -> list[dict]:
                 "snr_plain": float(snr_p),
                 "snr_gated": float(snr_g),
                 "d_snr": float(snr_g - snr_p),
+                "mae_plain": float("nan"),
+                "mae_gated": float("nan"),
+                "rmse_plain": float("nan"),
+                "rmse_gated": float("nan"),
+                "n_windows": 0,
                 "valid_pct": float(100.0 * valid.mean()),
                 "affine_ok": n_affine_ok,
                 "affine_fail": n_affine_fail,
             }
+            if polar is not None:
+                # Surowy sygnał metody — detrend/bandpass per okno wewnątrz validate.
+                vp = validate.validate_against_hr_series(
+                    sig_p, fs, polar.t_s, polar.hr_bpm, valid=valid
+                )
+                vg = validate.validate_against_hr_series(
+                    sig_g, fs, polar.t_s, polar.hr_bpm, valid=valid
+                )
+                row["mae_plain"] = float(vp["mae_bpm"])
+                row["mae_gated"] = float(vg["mae_bpm"])
+                row["rmse_plain"] = float(vp["rmse_bpm"])
+                row["rmse_gated"] = float(vg["rmse_bpm"])
+                row["n_windows"] = int(vp["n_windows_used"])
             rows.append(row)
             cleaned_store[(region, name, "plain")] = clean_p
             cleaned_store[(region, name, "gated")] = clean_g
-            print(
+            line = (
                 f"{region:<12} {name:<6} "
                 f"{hr_p:>10.2f} {hr_g:>10.2f} {hr_g - hr_p:>+8.2f} "
                 f"{snr_p:>10.2f} {snr_g:>10.2f} {snr_g - snr_p:>+8.2f}"
             )
+            if polar is not None:
+                line += f" {row['mae_plain']:>8.2f} {row['mae_gated']:>8.2f}"
+            print(line)
 
     out_dir = _out_dir(subject, scenario)
     out_dir.mkdir(parents=True, exist_ok=True)
     md = [
         f"# RGB vs RGB+termika — {subject}/{scenario}",
         "",
-        "Bez referencji EKG. SNR względem HR z wariantu **plain**.",
+        "SNR względem HR z wariantu **plain**. "
+        + (
+            "MAE: okna 10 s vs Polar H10."
+            if polar is not None
+            else "Brak pliku Polar HR."
+        ),
         "",
-        "| region | metoda | HR plain | HR gated | ΔHR | SNR plain [dB] | SNR gated [dB] | ΔSNR |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
+        mae_p = f"{row['mae_plain']:.2f}" if not np.isnan(row["mae_plain"]) else "—"
+        mae_g = f"{row['mae_gated']:.2f}" if not np.isnan(row["mae_gated"]) else "—"
         md.append(
             f"| {row['region']} | {row['method']} | {row['hr_plain']:.2f} | "
             f"{row['hr_gated']:.2f} | {row['d_hr']:+.2f} | "
-            f"{row['snr_plain']:.2f} | {row['snr_gated']:.2f} | {row['d_snr']:+.2f} |"
+            f"{row['snr_plain']:.2f} | {row['snr_gated']:.2f} | {row['d_snr']:+.2f} | "
+            f"{mae_p} | {mae_g} |"
         )
     md.append("")
     (out_dir / "comparison_table.md").write_text("\n".join(md) + "\n", encoding="utf-8")
@@ -341,6 +393,11 @@ def _write_summary(all_rows: list[dict]) -> Path:
         "snr_plain",
         "snr_gated",
         "d_snr",
+        "mae_plain",
+        "mae_gated",
+        "rmse_plain",
+        "rmse_gated",
+        "n_windows",
         "valid_pct",
         "affine_ok",
         "affine_fail",
@@ -349,29 +406,36 @@ def _write_summary(all_rows: list[dict]) -> Path:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in all_rows:
-            writer.writerow({k: row[k] for k in fieldnames})
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
 
     md_path = OUT_ROOT / "summary_all.md"
     lines = [
         "# Zbiorcze porównanie RGB vs RGB+termika (wszystkie nagrania)",
         "",
-        "Bez referencji EKG. SNR względem HR plain. ΔSNR > 0 ⇒ termika poprawia czystość sygnału.",
+        "ΔSNR > 0 ⇒ termika poprawia czystość. MAE: okna 10 s vs Polar (mniejsze = lepiej). ΔMAE = gated − plain.",
         "",
-        "| subject | scenario | region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR |",
+        "| subject | scenario | region | metoda | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | ΔMAE |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in all_rows:
+        mae_p = row.get("mae_plain", float("nan"))
+        mae_g = row.get("mae_gated", float("nan"))
+        if np.isnan(mae_p) or np.isnan(mae_g):
+            mae_p_s, mae_g_s, d_mae_s = "—", "—", "—"
+        else:
+            mae_p_s = f"{mae_p:.2f}"
+            mae_g_s = f"{mae_g:.2f}"
+            d_mae_s = f"{mae_g - mae_p:+.2f}"
         lines.append(
             f"| {row['subject']} | {row['scenario']} | {row['region']} | {row['method']} | "
-            f"{row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {row['d_hr']:+.2f} | "
-            f"{row['snr_plain']:.2f} | {row['snr_gated']:.2f} | {row['d_snr']:+.2f} |"
+            f"{row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {row['d_snr']:+.2f} | "
+            f"{mae_p_s} | {mae_g_s} | {d_mae_s} |"
         )
 
-    # Skrót: średnie ΔSNR per region/metoda
     lines.extend(["", "## Średnie ΔSNR [dB] (gated − plain)", ""])
-    lines.append("| region | metoda | średnie ΔSNR | n nagrań |")
+    lines.append("| region | metoda | średnie ΔSNR | n |")
     lines.append("|---|---|---:|---:|")
-    for region in REGIONS + ["cheeks"]:
+    for region in REGIONS_REPORT:
         for method in METHODS:
             vals = [
                 r["d_snr"]
@@ -382,6 +446,26 @@ def _write_summary(all_rows: list[dict]) -> Path:
                 lines.append(
                     f"| {region} | {method} | {float(np.mean(vals)):+.2f} | {len(vals)} |"
                 )
+
+    lines.extend(["", "## Średnie MAE vs Polar [BPM] (okna 10 s)", ""])
+    lines.append("| region | metoda | MAE plain | MAE gated | ΔMAE | n |")
+    lines.append("|---|---|---:|---:|---:|---:|")
+    for region in REGIONS_REPORT:
+        for method in METHODS:
+            subset = [
+                r
+                for r in all_rows
+                if r["region"] == region
+                and r["method"] == method
+                and not np.isnan(r.get("mae_plain", float("nan")))
+            ]
+            if not subset:
+                continue
+            mp = float(np.mean([r["mae_plain"] for r in subset]))
+            mg = float(np.mean([r["mae_gated"] for r in subset]))
+            lines.append(
+                f"| {region} | {method} | {mp:.2f} | {mg:.2f} | {mg - mp:+.2f} | {len(subset)} |"
+            )
     lines.append("")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return md_path

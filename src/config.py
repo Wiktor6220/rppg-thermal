@@ -43,6 +43,25 @@ MIN_VALID_RATIO: float = 0.5
 # odchyleń standardowych liczonych w obrębie ROI. Próg względny wobec rozkładu ROI,
 # a nie normalizacja per klatka — pracujemy na temperaturze bezwzględnej (CLAUDE.md).
 PERFUSION_TEMP_STD_FACTOR: float = 0.5
+# Gdy maska perfuzji pokrywa mniej niż ten ułamek ROI → fallback do pełnego ROI
+# (nie psuje sygnału przy zbyt ostrej / przesuniętej masce).
+PERFUSION_MIN_ROI_FRAC: float = 0.10
+
+# --- Referencja Polar H10 (plik *_HR.csv) ---
+# Kolumna 4 (1-based; nagłówek „2026”) = HR [BPM]. Pierwsze N próbek = kalibracja.
+POLAR_HR_COLUMN: int = 3  # 0-based index
+POLAR_HR_SKIP_SAMPLES: int = 5
+
+# --- Odświeżanie affine termika→RGB (klatki) wg scenariusza ---
+# s1/s2: spokojniej; s3/s4: ruch; s5: zmienny dystans / paralaksa.
+AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
+    "s1_rest_rest": 30,
+    "s2_person_move": 30,
+    "s3_drone_move": 10,
+    "s4_both_move": 10,
+    "s5_approach": 5,
+}
+AFFINE_EVERY_DEFAULT: int = 30
 
 # --- Korejestracja termika → RGB (registration.py) ---
 # Nominalne odwzorowanie RGB→termika służy TYLKO do wycięcia okna segmentacji

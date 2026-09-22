@@ -11,7 +11,7 @@ do późniejszego odrzucania OKIEN w walidacji.
 
 import numpy as np
 
-from src.config import PERFUSION_TEMP_STD_FACTOR
+from src.config import PERFUSION_MIN_ROI_FRAC, PERFUSION_TEMP_STD_FACTOR
 
 _EPS = 1e-8
 
@@ -136,7 +136,10 @@ def extract_rgb_trace_thermal_gated(
     for i in range(n_frames):
         roi_mask = _roi_to_mask(roi_positions[i], height, width)
         perfusion_mask = compute_perfusion_mask(thermal_frames[i], roi_mask)
-        # Przy pustej masce perfuzji wracamy do pełnego ROI — nie gubimy klatki.
-        gated_mask = perfusion_mask if perfusion_mask.any() else roi_mask
+        # Pusta / zbyt mała maska → pełne ROI (nie gubimy klatki, nie szumimy śladu).
+        n_roi = int(roi_mask.sum())
+        n_perf = int(perfusion_mask.sum())
+        use_gated = n_roi > 0 and n_perf >= PERFUSION_MIN_ROI_FRAC * n_roi
+        gated_mask = perfusion_mask if use_gated else roi_mask
         trace[i] = _mean_rgb_in_mask(rgb_frames[i], gated_mask)
     return trace

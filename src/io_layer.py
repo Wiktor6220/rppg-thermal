@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from src.config import DATA_DIR
+from src.config import DATA_DIR, POLAR_HR_COLUMN, POLAR_HR_SKIP_SAMPLES
 
 # Konwencja nazw strumieni w folderze sesji (porównania case-insensitive).
 _RGB_SUFFIX = "rgb"
@@ -369,6 +369,70 @@ def _resolve_target_size(
     raise ValueError(
         f"match_resolution musi być None, 'rgb' albo 'thermal', otrzymano {match_resolution!r}"
     )
+
+
+# --- Referencja Polar H10 ---
+
+
+@dataclass(frozen=True)
+class PolarHrSeries:
+    """Seria HR z pliku Polar ``*_HR.csv`` (czas względem pierwszej próbki po skipie)."""
+
+    t_s: np.ndarray  # sekundy od startu serii (≈ start wideo)
+    hr_bpm: np.ndarray  # BPM
+
+
+def find_polar_hr_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:
+    """Zwraca ścieżkę do ``*_HR.csv`` w folderze sesji albo None, gdy brak pliku."""
+    rec = find_recording(subject, scenario, data_dir)
+    session_dir = rec.rgb_path.parent
+    matches = sorted(session_dir.glob("*_HR.csv")) + sorted(session_dir.glob("*HR.csv"))
+    # Unikaj duplikatów przy pokrywających się globach.
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if unique else None
+
+
+def load_polar_hr(
+    subject: str,
+    scenario: str,
+    data_dir: Path = DATA_DIR,
+    skip_samples: int = POLAR_HR_SKIP_SAMPLES,
+    hr_column: int = POLAR_HR_COLUMN,
+) -> PolarHrSeries | None:
+    """Wczytuje HR z Polara H10: kolumna BPM, pomija pierwsze ``skip_samples`` po nagłówku.
+
+    Czas ``t_s`` liczony jest od pierwszej zachowanej próbki (założenie: START badania
+    ≈ początek wideo). Zwraca None, gdy brak pliku (np. subject01/s5).
+    """
+    path = find_polar_hr_path(subject, scenario, data_dir)
+    if path is None:
+        return None
+
+    import csv
+    from datetime import datetime
+
+    with path.open(newline="") as f:
+        rows = list(csv.reader(f))
+    if len(rows) <= 1 + skip_samples:
+        return None
+
+    data = rows[1 + skip_samples :]
+    times: list[datetime] = []
+    hrs: list[float] = []
+    for row in data:
+        if len(row) <= hr_column:
+            continue
+        try:
+            times.append(datetime.strptime(row[0].strip(), "%H:%M:%S.%f"))
+            hrs.append(float(row[hr_column]))
+        except (ValueError, IndexError):
+            continue
+    if not hrs:
+        return None
+
+    t0 = times[0]
+    t_s = np.array([(t - t0).total_seconds() for t in times], dtype=np.float64)
+    return PolarHrSeries(t_s=t_s, hr_bpm=np.asarray(hrs, dtype=np.float64))
 
 
 # --- Placeholdery dla publicznych zbiorów referencyjnych (do implementacji później) ---
