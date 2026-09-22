@@ -38,18 +38,17 @@ from src.roi import make_cropping_detector  # noqa: E402
 SUBJECT, SCENARIO = "subject01", "s1_rest_rest"
 
 # Definicje punktów kontrolnych: (indeks landmarku RGB, etykieta, punkt termiczny lub None,
-# czy należy do rejonu PERFUZJI — skronie/policzki/czoło). Czubek nosa (4) usunięty (poza
-# płaszczyzną twarzy). Punkty z termika=None czekają na odczyt z gridu.
+# czy należy do rejonu PERFUZJI — skronie/policzki/czoło). Czubek nosa (4) i nasada nosa (168)
+# usunięte (poza płaszczyzną / nie próbkujemy). Usta = tylko anchor geometryczny (perf=False).
+# Wartości termiczne startowe — do podmiany na wynik z scripts/pick_thermal_points.py.
 POINTS = [
-    (127, "skroń L (127)", (615.0, 370.0), True),
-    (356, "skroń P (356)", (742.0, 370.0), True),
-    (168, "nasada nosa (168)", (675.0, 378.0), False),
-    (61, "kącik ust L (61)", (652.0, 468.0), False),
-    (291, "kącik ust P (291)", (700.0, 468.0), False),
-    (205, "policzek L (205)", None, True),  # TODO: termika z gridu
-    (425, "policzek P (425)", None, True),  # TODO: termika z gridu
-    (9, "czoło środek (9)", None, True),  # TODO: termika z gridu
-    (152, "broda (152)", None, False),  # TODO: termika z gridu
+    (127, "skroń L (127)", (667.1, 491.6), True),
+    (356, "skroń P (356)", (789.4, 491.6), True),
+    (9, "czoło środek (9)", (721.6, 453.4), True),
+    (205, "policzek L (205)", (681.1, 540.7), True),
+    (425, "policzek P (425)", (767.6, 544.6), True),
+    (61, "kącik ust L (61)", (701.4, 554.0), False),
+    (291, "kącik ust P (291)", (735.7, 552.4), False),
 ]
 
 
