@@ -44,6 +44,25 @@ MIN_VALID_RATIO: float = 0.5
 # a nie normalizacja per klatka — pracujemy na temperaturze bezwzględnej (CLAUDE.md).
 PERFUSION_TEMP_STD_FACTOR: float = 0.5
 
+# --- Korejestracja termika → RGB (registration.py) ---
+# Nominalne odwzorowanie RGB→termika służy TYLKO do wycięcia okna segmentacji
+# (nie do precyzji). Affine: kontury masek + refine Y linii oczu.
+# Wartości empiryczne z subject01/s1 (probe).
+REG_NOMINAL_SCALE: float = 0.52
+REG_NOMINAL_OFFSET: tuple[float, float] = (-340.0, -60.0)  # [px termiki]
+REG_WINDOW_PAD: float = 2.0  # powiększenie okna wokół nominalnej twarzy
+REG_MORPH_KERNEL: int = 7
+REG_NECK_WIDTH_FRAC: float = 0.62  # cięcie szyi: ułamek maks. szerokości twarzy
+# Pas wyszukiwania linii oczu na masce termicznej (ułamek wysokości maski od góry).
+# Nie od 0 — góra maski (włosy/czoło) jest ciemniejsza i fałszywie wygrywa.
+REG_EYE_BAND_TOP: float = 0.35
+REG_EYE_BAND_BOTTOM: float = 0.55
+# Zewnętrzne kąciki oczu MediaPipe (Face Mesh) — cel refine Y.
+REG_EYE_LANDMARK_L: int = 33
+REG_EYE_LANDMARK_R: int = 263
+# Próg go/no-go (RMS vs ręczny GT). Ręczna ~10.5; kontur+Y-oczy ~13 px na s1.
+REG_GO_RMS_PX: float = 18.0
+
 # --- Ścieżki ---
 
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent

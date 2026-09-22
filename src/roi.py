@@ -9,6 +9,9 @@ import modułu i testy jednostkowe (atrapa detektora) pozostały szybkie.
 """
 
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
+import os
+import sys
 
 import cv2
 import numpy as np
@@ -16,6 +19,28 @@ import numpy as np
 from src.config import FACE_LANDMARKER_MODEL_PATH, FACE_MESH_LANDMARK_INDICES
 
 _FACE_LANDMARKER = None  # singleton MediaPipe Tasks FaceLandmarker (tworzony leniwie)
+
+
+def _quiet_native_logs() -> None:
+    """Tłumi spam C++ z MediaPipe / TFLite / glog (INFO/WARNING/ERROR telemetry)."""
+    os.environ["GLOG_minloglevel"] = "3"  # tylko FATAL
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+
+
+@contextmanager
+def _suppress_stderr():
+    """Przekierowuje fd=2 na /dev/null (logi natywne omijają logging Pythona)."""
+    devnull = open(os.devnull, "w")
+    stderr_fd = sys.stderr.fileno()
+    saved = os.dup(stderr_fd)
+    try:
+        os.dup2(devnull.fileno(), stderr_fd)
+        yield
+    finally:
+        os.dup2(saved, stderr_fd)
+        os.close(saved)
+        devnull.close()
 
 
 def _get_face_landmarker():
@@ -32,6 +57,7 @@ def _get_face_landmarker():
                 f"Brak modelu FaceLandmarker: {FACE_LANDMARKER_MODEL_PATH}. "
                 "Pobierz face_landmarker.task do models/ (patrz komentarz w config.py)."
             )
+        _quiet_native_logs()
         from mediapipe.tasks import python as mp_python  # leniwy import — ciężka biblioteka
         from mediapipe.tasks.python import vision
 
@@ -40,7 +66,9 @@ def _get_face_landmarker():
             running_mode=vision.RunningMode.IMAGE,
             num_faces=1,
         )
-        _FACE_LANDMARKER = vision.FaceLandmarker.create_from_options(options)
+        # Init MediaPipe sypie I/W/E na stderr mimo GLOG_minloglevel.
+        with _suppress_stderr():
+            _FACE_LANDMARKER = vision.FaceLandmarker.create_from_options(options)
     return _FACE_LANDMARKER
 
 
