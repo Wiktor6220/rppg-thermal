@@ -1,13 +1,24 @@
+# Dane i artefakty lokalne (duże / niepubliczne)
 data/
 results/
 models/
 .venv/
-__pycache__/
-*.pyc
-.cloude
-CONTEXT.md
-CLAUDE.md
 .claude/
-notebooks/
+
+# Cache / śmieci
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 .DS_Store
+Thumbs.db
+
 report.md
+CLAUDE.md
+CONTEXT.md
+.claude/
+
+notebooks/

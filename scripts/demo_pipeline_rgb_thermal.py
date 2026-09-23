@@ -15,12 +15,19 @@ Uruchomienie:
     uv run python scripts/demo_pipeline_rgb_thermal.py
     uv run python scripts/demo_pipeline_rgb_thermal.py --subject subject02 --scenario s3_drone_move
     uv run python scripts/demo_pipeline_rgb_thermal.py --all
+
+Ręczna affine (GT z auto_manual_registration — rozdzielenie warping vs maska):
+    uv run python scripts/demo_pipeline_rgb_thermal.py \\
+        --subject subject01 --scenario s1_rest_rest --manual-gt auto
+    # albo wskaż plik:
+    #   --manual-gt results/registration_probe/subject01_s1_rest_rest/f00000_gt_points.json
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -100,8 +107,67 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Przelicz wszystkie kompletne nagrania w data/ i zapisz tabelę zbiorczą.",
     )
+    parser.add_argument(
+        "--manual-gt",
+        default=None,
+        metavar="PATH|auto",
+        help=(
+            "Stała ręczna affine z pliku GT (json z auto_manual_registration). "
+            "Wartość 'auto' = results/registration_probe/<subject>_<scenario>/f00000_gt_points.json. "
+            "Wyniki trafiają do …/<scenario>_manual/ (nie nadpisują przebiegu auto)."
+        ),
+    )
     return parser.parse_args()
 
+
+def _resolve_manual_gt(subject: str, scenario: str, manual_gt: str) -> Path:
+    """Zwraca ścieżkę do f*.json z klikniętymi punktami termicznymi."""
+    if manual_gt.strip().lower() == "auto":
+        path = (
+            RESULTS_DIR
+            / "registration_probe"
+            / f"{subject}_{scenario}"
+            / "f00000_gt_points.json"
+        )
+    else:
+        path = Path(manual_gt).expanduser()
+        if not path.is_absolute():
+            path = (ROOT / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Brak pliku GT: {path}\n"
+            f"Najpierw: uv run python scripts/auto_manual_registration.py "
+            f"--subject {subject} --scenario {scenario}"
+        )
+    return path
+
+
+def _fit_affine_from_gt(landmarks: np.ndarray, gt: dict) -> np.ndarray:
+    """Affine LS termika→RGB z klikniętych punktów i landmarków na tej klatce."""
+    idxs = [int(i) for i in gt["landmark_idx"]]
+    thermal_xy = np.asarray(gt["thermal_xy"], dtype=np.float64)
+    rgb_xy = np.asarray([landmarks[i] for i in idxs], dtype=np.float64)
+    if thermal_xy.shape != rgb_xy.shape:
+        raise ValueError(
+            f"Niezgodna liczba punktów GT: thermal {thermal_xy.shape} vs rgb {rgb_xy.shape}"
+        )
+    matrix, _ = cv2.estimateAffine2D(
+        thermal_xy.astype(np.float32),
+        rgb_xy.astype(np.float32),
+        method=cv2.RANSAC,
+        ransacReprojThreshold=1e6,
+    )
+    if matrix is None:
+        raise RuntimeError("estimateAffine2D nie zwróciło macierzy z GT.")
+    resid = np.linalg.norm(apply_affine(matrix.astype(np.float64), thermal_xy) - rgb_xy, axis=1)
+    rms = float(np.sqrt(np.mean(resid**2)))
+    # czoło = landmark 9, zwykle 3. punkt w CONTROL_POINTS
+    forehead_i = idxs.index(9) if 9 in idxs else 2
+    print(
+        f"  Ręczna affine z GT: RMS={rms:.1f} px, "
+        f"czoło={resid[forehead_i]:.1f} px  (stała na całe nagranie)"
+    )
+    return matrix.astype(np.float64)
 
 def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     y0, x0, y1, x1 = (int(v) for v in bbox)
@@ -175,19 +241,34 @@ def _process_signal(rgb_trace: np.ndarray, fs: float, method_fn) -> tuple[np.nda
     return cleaned, hr
 
 
-def _out_dir(subject: str, scenario: str) -> Path:
-    return OUT_ROOT / subject / scenario
+def _out_dir(subject: str, scenario: str, manual: bool = False) -> Path:
+    suffix = "_manual" if manual else ""
+    return OUT_ROOT / subject / f"{scenario}{suffix}"
 
 
-def run_one(subject: str, scenario: str) -> list[dict]:
-    """Przelicza jedno nagranie; zwraca wiersze wyników i zapisuje je lokalnie."""
+def run_one(
+    subject: str,
+    scenario: str,
+    manual_gt: Path | None = None,
+) -> list[dict]:
+    """Przelicza jedno nagranie; zwraca wiersze wyników i zapisuje je lokalnie.
+
+    ``manual_gt``: jeśli podane, gated używa **stałej** affine z klikniętych punktów
+    (bez odświeżania auto) — eksperyment rozdzielający warping vs maskę.
+    """
     loaded = load_recording(subject, scenario)
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
+    use_manual = manual_gt is not None
     affine_every = _affine_every(scenario)
     print(f"\n{'=' * 60}")
     print(f"Nagranie: {subject}/{scenario}  {n_frames} klatek @ {fs:.3f} fps")
-    print(f"Affine odświeżana co {affine_every} klatek")
+    if use_manual:
+        print(f"Affine: RĘCZNA stała z GT  ({manual_gt})")
+        gt = json.loads(manual_gt.read_text(encoding="utf-8"))
+    else:
+        print(f"Affine: AUTO, odświeżana co {affine_every} klatek")
+        gt = None
 
     detector = make_cropping_detector()
     # Ekstrakcja: forehead + L/R. Raport tylko: forehead + cheeks (= średnia L+R).
@@ -207,7 +288,16 @@ def run_one(subject: str, scenario: str) -> list[dict]:
             boxes = _region_boxes(landmarks)
             last_boxes = boxes
             valid_list.append(True)
-            if affine is None or (i % affine_every == 0):
+            if use_manual:
+                if affine is None:
+                    try:
+                        affine = _fit_affine_from_gt(landmarks, gt)
+                        n_affine_ok = 1
+                    except Exception as exc:  # noqa: BLE001
+                        n_affine_fail += 1
+                        if i == 0:
+                            print(f"  [warn] ręczna affine: {exc}")
+            elif affine is None or (i % affine_every == 0):
                 new_affine, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
                 if new_affine is not None:
                     affine = new_affine
@@ -292,6 +382,7 @@ def run_one(subject: str, scenario: str) -> list[dict]:
             row = {
                 "subject": subject,
                 "scenario": scenario,
+                "affine_mode": "manual" if use_manual else "auto",
                 "region": region,
                 "method": name,
                 "hr_plain": float(hr_p),
@@ -334,11 +425,17 @@ def run_one(subject: str, scenario: str) -> list[dict]:
                 line += f" {row['mae_plain']:>8.2f} {row['mae_gated']:>8.2f}"
             print(line)
 
-    out_dir = _out_dir(subject, scenario)
+    out_dir = _out_dir(subject, scenario, manual=use_manual)
     out_dir.mkdir(parents=True, exist_ok=True)
+    mode_note = (
+        f"Affine: **ręczna stała** z `{manual_gt.name}`."
+        if use_manual
+        else "Affine: **auto** (kontury + eye_y)."
+    )
     md = [
         f"# RGB vs RGB+termika — {subject}/{scenario}",
         "",
+        mode_note,
         "SNR względem HR z wariantu **plain**. "
         + (
             "MAE: okna 10 s vs Polar H10."
@@ -369,7 +466,10 @@ def run_one(subject: str, scenario: str) -> list[dict]:
     ax.set_xlim(BAND_LOW_HZ * 60, BAND_HIGH_HZ * 60)
     ax.set_xlabel("częstość [BPM]")
     ax.set_ylabel("gęstość mocy [j.u.]")
-    ax.set_title(f"Widmo CHROM forehead — plain vs gated ({subject}/{scenario})")
+    mode_lbl = "manual affine" if use_manual else "auto affine"
+    ax.set_title(
+        f"Widmo CHROM forehead — plain vs gated ({subject}/{scenario}, {mode_lbl})"
+    )
     ax.legend(loc="upper right")
     fig.savefig(out_dir / "spectrum_forehead_chrom.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -475,6 +575,14 @@ def main() -> None:
     args = _parse_args()
     _mute_native_stderr()
 
+    if args.all and args.manual_gt:
+        raise SystemExit(
+            "--all z --manual-gt nie jest wspierane (każde nagranie ma własny GT). "
+            "Odpalaj pojedynczo, np.:\n"
+            "  uv run python scripts/demo_pipeline_rgb_thermal.py "
+            "--subject subject01 --scenario s1_rest_rest --manual-gt auto"
+        )
+
     if args.all:
         recordings = list_recordings()
         if not recordings:
@@ -498,10 +606,12 @@ def main() -> None:
                 print(f"  - {msg}")
         return
 
-    rows = run_one(args.subject, args.scenario)
-    # Przy pojedynczym nagraniu też dopisz/odśwież mini-summary tylko tego runu? Nie —
-    # zbiorcza powstaje wyłącznie przy --all. Jedno nagranie ma swój comparison_table.md.
-    _ = rows
+    gt_path: Path | None = None
+    if args.manual_gt:
+        gt_path = _resolve_manual_gt(args.subject, args.scenario, args.manual_gt)
+        print(f"Tryb ręcznej affine: {gt_path}")
+
+    run_one(args.subject, args.scenario, manual_gt=gt_path)
 
 
 if __name__ == "__main__":
