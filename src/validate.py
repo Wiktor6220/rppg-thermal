@@ -63,9 +63,7 @@ def compute_mae(estimated: np.ndarray, reference: np.ndarray) -> float:
 
 
 def compute_rmse(estimated: np.ndarray, reference: np.ndarray) -> float:
-    """Liczy pierwiastek błędu średniokwadratowego (RMSE) między estymatami HR a referencją.
-
-    Pary z NaN (okno pominięte/nieudane) są ignorowane, analogicznie do `compute_mae`.
+    """RMSE między estymatami HR a referencją (pary z NaN pomijane).
 
     Args:
         estimated: 1D tablica estymat HR (per okno, bpm), może zawierać NaN.

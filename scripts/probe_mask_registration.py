@@ -1,4 +1,4 @@
-"""Go/no-go auto-korejestracji (src.registration) vs ręczny GT offline."""
+"""Walidacja auto-korejestracji względem ręcznego GT (jedna para klatek)."""
 
 from __future__ import annotations
 

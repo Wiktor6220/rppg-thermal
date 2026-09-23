@@ -1,4 +1,4 @@
-"""Porównanie affine auto (registration) vs ręcznej (kliknięcia na termice); zapis do results/registration_probe/."""
+"""Porównanie affine auto vs ręcznej (kliknięcia na termice)."""
 
 from __future__ import annotations
 
