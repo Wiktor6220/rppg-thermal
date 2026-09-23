@@ -1,18 +1,4 @@
-"""scripts/demo_pipeline_rgb.py — pierwszy pełny przelot potoku RGB-only na realnym nagraniu.
-
-Bez termiki, bez warpingu, bez Polara. Dla subject01/s1_rest_rest:
-  1. wczytuje klatki RGB (io_layer) i śledzi ROI (roi.track_roi_across_frames + detektor
-     wycinkowy, ten sam co dał 100% pokrycia),
-  2. dla regionów forehead/left_cheek/right_cheek liczy przez extract.py średnie RGB w
-     czasie (cały bbox ROI, bez maski),
-  3. przepuszcza przez CHROM i POS (methods.py), potem estimate.py: detrend, bandpass
-     0.7–4 Hz, HR z Welcha — osobno dla każdego regionu i metody,
-  4. zapisuje wykresy + tabelę HR do results/pipeline_rgb/,
-  5. wypisuje tabelę HR i rozrzut między regionami/metodami.
-
-fs = rzeczywiste fps nagrania (nie zakładamy 30). Uruchomienie:
-    uv run python scripts/demo_pipeline_rgb.py
-"""
+"""Demo potoku RGB-only: ROI → extract → CHROM/POS → HR; wyniki w results/pipeline_rgb/."""
 
 import os
 import sys

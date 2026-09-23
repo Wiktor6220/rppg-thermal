@@ -1,25 +1,11 @@
-"""scripts/check_data.py — raport spójności danych w data/ (TYLKO odczyt).
-
-Skrypt niczego nie nadpisuje ani nie przenosi. Przechodzi po `data/subjectXX/sN_*`
-i raportuje:
-  - kompletność zestawu 4 plików na sesję (rgb, thermal, HR, ECG) + braki,
-  - niespójności nazw (surowe nazwy Polara `dataHR_/dataECG_`, literówki/case w
-    rozszerzeniach, pliki `.DS_Store`, pliki nieoczekiwane),
-  - dla wideo: liczba klatek, FPS, rozdzielczość, długość (przez OpenCV),
-  - dla plików Polara: czas startu wyłuskany z nagłówka (`TIMESTAMP,...`) i/lub z nazwy.
-
-Dodatkowo listuje surowe pliki Polara w `data/polar/` z ich czasami startu — to pomaga
-ręcznie przypisać je do sesji przed napisaniem loadera.
-
-Uruchomienie:  uv run python scripts/check_data.py
-"""
+"""Raport spójności plików w data/ (wideo, Polar, braki, metadane OpenCV)."""
 
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# Root repo na ścieżkę, by zaimportować src.config (jedyne źródło ścieżek — CLAUDE.md).
+# Root repo na sys.path (import src.config).
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

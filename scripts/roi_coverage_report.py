@@ -1,17 +1,4 @@
-"""scripts/roi_coverage_report.py — pokrycie detekcji ROI na WSZYSTKICH nagraniach.
-
-Dla każdego nagrania (subject01/02 × s1–s5) uruchamia przetestowaną logikę
-`roi.track_roi_across_frames` z detektorem „detekcja na wycinku twarzy" i zbiera:
-  - % klatek valid (faktyczna detekcja), liczbę i łączną długość przerw (hold),
-    najdłuższą przerwę,
-do jednej tabeli results/roi_coverage.md (+ wydruk).
-
-Dla każdego nagrania zapisuje kilka klatek z narysowanym ROI do
-results/roi_preview/<subject>_<scenario>/ — równomiernie w czasie ORAZ z okolic
-najdłuższych przerw w detekcji (klatka przed/pośrodku/po przerwie).
-
-NIE robi ekstrakcji ani maski termicznej. Uruchomienie: uv run python scripts/roi_coverage_report.py
-"""
+"""Raport pokrycia detekcji ROI na wszystkich nagraniach → results/roi_coverage.md."""
 
 import os
 import sys

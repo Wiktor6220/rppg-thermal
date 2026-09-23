@@ -16,23 +16,7 @@ _EPS = 1e-12
 
 
 def detrend_signal(signal: np.ndarray, lambda_param: float = DETREND_LAMBDA) -> np.ndarray:
-    """Usuwa wolnozmienny trend metodą smoothness priors (Tarvainen et al., 2002).
-
-    Trend jest szacowany jako przebieg z minimalną krzywizną, który jednocześnie
-    dobrze przybliża sygnał wejściowy: minimalizowana jest suma kwadratów
-    odchyleń trendu od sygnału, karana drugą pochodną (krzywizną) trendu ważoną
-    parametrem `lambda_param`. Rozwiązanie ma postać zamkniętą
-    `z_trend = (I + lambda^2 * D2^T D2)^-1 z`, gdzie `D2` to macierz drugiej
-    różnicy. Im większe `lambda_param`, tym silniej tłumione są wolne składowe
-    (silniejszy efekt górnoprzepustowy).
-
-    Args:
-        signal: 1D sygnał wejściowy.
-        lambda_param: parametr regularyzacji. Domyślnie `config.DETREND_LAMBDA`.
-
-    Returns:
-        1D sygnał po usunięciu trendu, tej samej długości co wejście.
-    """
+    """Detrend smoothness priors (Tarvainen et al., 2002); lambda z config."""
     signal = np.asarray(signal, dtype=np.float64)
     n = signal.shape[0]
     if n < 3:
@@ -127,25 +111,7 @@ def snr_rppg(
     n_harmonics: int = 2,
     bin_width_hz: float = 0.2,
 ) -> float:
-    """Stosunek sygnału do szumu (SNR) sygnału rPPG względem znanej częstości HR.
-
-    Miara w duchu de Haan & Jeanne (2013): moc skupiona w wąskich prążkach wokół
-    częstości podstawowej HR i jej harmonicznych („sygnał tętna") odniesiona do
-    mocy w pozostałej części pasma fizjologicznego („reszta"). Im czystszy sygnał
-    pulsacyjny (mniej artefaktów ruchu/szumu w paśmie), tym wyższe SNR. Pozwala
-    różnicować metody rPPG tam, gdzie sama estymata HR jeszcze się nie rozjeżdża.
-
-    Args:
-        signal: 1D sygnał rPPG (wyjście metody z `methods.py`).
-        fs: częstotliwość próbkowania sygnału (Hz).
-        ref_hr_bpm: referencyjna (znana) częstość HR w bpm, wokół której skupiona
-            jest oczekiwana moc pulsacji.
-        n_harmonics: liczba uwzględnianych harmonicznych (1 = tylko podstawowa).
-        bin_width_hz: połowa szerokości prążka wokół każdej harmonicznej (Hz).
-
-    Returns:
-        SNR w decybelach (10*log10(moc_sygnału / moc_reszty_pasma)).
-    """
+    """SNR w paśmie HR: moc w prążkach przy ref_hr vs reszta pasma [dB]."""
     signal = np.asarray(signal, dtype=np.float64)
     freqs, psd = periodogram(signal, fs=fs)
 

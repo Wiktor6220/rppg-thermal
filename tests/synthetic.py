@@ -1,9 +1,4 @@
-"""Generatory sygnałów i klatek syntetycznych dla testów.
-
-Nie jest to moduł testowy (brak prefiksu `test_`) — pytest go nie zbiera.
-Trzyma logikę generującą dane, przeniesioną z bloków `__main__` modułów `src/`,
-aby testy mogły ją współdzielić bez powielania.
-"""
+"""Generatory sygnałów i klatek syntetycznych (współdzielone przez testy)."""
 
 import numpy as np
 from scipy.signal import periodogram
@@ -81,30 +76,7 @@ def generate_hard_synthetic_rgb(
     noise_std: float = 0.5,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Trudny syntetyczny RGB: zmienne HR (HRV), wspólny artefakt ruchu i regulowany SNR.
-
-    Model bliższy realnemu niż czysty sinus:
-      - HRV: chwilowa częstość HR faluje wokół `hr_bpm` (arytmia zatokowa oddechowa),
-      - artefakt ruchu/oświetlenia: WSPÓLNA multiplikatywna zmiana jasności wszystkich
-        kanałów — składowa intensywności, którą CHROM/POS z założenia tłumią (kanały
-        znoszą się w projekcji chrominancji), a GREEN przepuszcza w całości. Ma część
-        wolną (`motion_amplitude`, ~0.11 Hz + błądzenie) oraz — co kluczowe —
-        składową W PAŚMIE tętna (`interference_amplitude` przy `interference_freq_hz`,
-        np. 1.6 Hz ≈ 96 bpm), która psuje SNR GREEN, ale nie CHROM/POS,
-      - pulsacja o sygnaturze chrominancji (różne wagi per kanał, zielony najsilniejszy)
-        — dzięki różnym wagom przeżywa projekcję CHROM/POS,
-      - regulowany SNR przez `pulse_amplitude` (siła pulsu) i `noise_std` (szum).
-
-    Dobór amplitud jest celowy: `interference_amplitude` > `pulse_amplitude` (w kanale
-    zielonym pulsu i artefaktu wagi są ~1, więc artefakt dominuje) — dlatego GREEN
-    „przykleja się" do częstości artefaktu. Jednocześnie `pulse_amplitude` jest na tyle
-    duże, że po odrzuceniu artefaktu przez CHROM/POS puls pozostaje odzyskiwalny w
-    szerokim zakresie `noise_std` (rozpad w czystym szumie następuje dopiero przy
-    bardzo wysokim szumie).
-
-    Zwraca (rgb_trace (N, 3), t). Pulsacja jest multiplikatywna względem DC, więc
-    normalizacja po osi czasu (a nie per klatka) zachowuje kształt tętna.
-    """
+    """Trudny RGB: HRV, wspólny artefakt jasności w paśmie tętna, puls multiplikatywny."""
     rng = np.random.default_rng(seed)
     n_samples = int(round(fs * duration_s))
     t = np.arange(n_samples) / fs
@@ -142,25 +114,10 @@ def generate_synthetic_frames(
     noise_std: float = 1.5,
     seed: int = 0,
 ) -> dict:
-    """Generuje syntetyczne KLATKI: RGB + skorejestrowaną termikę z łatą perfuzji.
-
-    Konstrukcja odzwierciedla tezę pracy: istnieje przestrzenna łata (patch) o
-    podwyższonej temperaturze (wysoka perfuzja), skorejestrowana między kamerą RGB
-    i termiczną. TYLKO piksele łaty niosą silny sygnał pulsacyjny; reszta ROI to
-    prawie sam szum. Dzięki temu ekstrakcja bramkowana termiką (łata) daje czystszy
-    sygnał niż uśrednianie po całym ROI.
-
-    Termika ma wartości radiometryczne (temperatura bezwzględna, °C), bez normalizacji.
+    """Klatki RGB + termika; puls tylko w łacie wysokiej perfuzji w ROI.
 
     Returns:
-        Słownik z kluczami:
-            "rgb_frames": (N, H, W, 3) float,
-            "thermal_frames": (N, H, W) float — temperatura bezwzględna,
-            "roi_mask": (H, W) bool — cały analizowany obszar,
-            "roi_positions": lista długości N tej samej maski ROI (ROI stałe w czasie),
-            "valid": (N,) bool (wszystkie True),
-            "patch_mask": (H, W) bool — prawdziwa łata wysokiej perfuzji,
-            "hr_bpm": zadane HR, "t": (N,) oś czasu.
+        rgb_frames, thermal_frames, roi_mask, roi_positions, valid, patch_mask, hr_bpm, t.
     """
     rng = np.random.default_rng(seed)
     n_frames = int(round(fs * duration_s))

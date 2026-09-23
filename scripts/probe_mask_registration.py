@@ -1,10 +1,4 @@
-"""scripts/probe_mask_registration.py — go/no-go auto-korejestracji (kontury masek).
-
-Używa ``src.registration`` (bez HITL). Walidacja względem ręcznego GT z
-``probe_registration`` (tylko metryka offline — nie wchodzi do runtime).
-
-Uruchomienie: uv run python scripts/probe_mask_registration.py
-"""
+"""Go/no-go auto-korejestracji (src.registration) vs ręczny GT offline."""
 
 from __future__ import annotations
 

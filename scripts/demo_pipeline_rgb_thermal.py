@@ -1,26 +1,6 @@
-"""scripts/demo_pipeline_rgb_thermal.py — porównanie RGB vs RGB+termika.
+"""Porównanie potoku RGB (plain) vs RGB+bramkowanie termiką (gated); opcjonalnie Polar HR.
 
-Dla każdego regionu ROI:
-  plain  = średnie RGB w bboxie,
-  gated  = średnie RGB w bboxie ∩ masce perfuzji (termika przez odwrotną affine);
-           przy masce < PERFUSION_MIN_ROI_FRAC ROI → fallback do plain.
-Region ``cheeks`` = średnia śladów left/right (bez nosa/ust); w tabeli tylko forehead + cheeks.
-
-Gdy jest ``*_HR.csv`` (Polar): MAE/RMSE w oknach 10 s (krok 5 s) vs średnia Polar w oknie.
-
-Wyniki per nagranie: ``results/pipeline_rgb_thermal/<subject>/<scenario>/``
-Zbiorczo (``--all``): ``results/pipeline_rgb_thermal/summary_all.md`` (+ .csv).
-
-Uruchomienie:
-    uv run python scripts/demo_pipeline_rgb_thermal.py
-    uv run python scripts/demo_pipeline_rgb_thermal.py --subject subject02 --scenario s3_drone_move
-    uv run python scripts/demo_pipeline_rgb_thermal.py --all
-
-Ręczna affine (GT z auto_manual_registration — rozdzielenie warping vs maska):
-    uv run python scripts/demo_pipeline_rgb_thermal.py \\
-        --subject subject01 --scenario s1_rest_rest --manual-gt auto
-    # albo wskaż plik:
-    #   --manual-gt results/registration_probe/subject01_s1_rest_rest/f00000_gt_points.json
+Wyniki: results/pipeline_rgb_thermal/. Uruchomienie: uv run python scripts/demo_pipeline_rgb_thermal.py [--all]
 """
 
 from __future__ import annotations
@@ -32,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-# Przed importem OpenCV/MediaPipe — inaczej logi C++ i tak się wyleją.
+# Przed OpenCV/MediaPipe — mniej logów C++ na stderr.
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["ABSL_MIN_LOG_LEVEL"] = "3"

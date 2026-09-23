@@ -1,13 +1,4 @@
-"""scripts/auto_registration_probe.py — automat korejestracji RGB↔termika (go/no-go).
-
-DIAGNOSTYKA subject01/s1 (nie rusza src/, nie generalizuje na inne nagrania). Klasa
-transformacji zablokowana = pełna affine (estimateAffine2D, LS). Strona RGB automatyczna
-(make_cropping_detector, 468 landmarków). Strona termiczna automatyczna: okno z NOMINALNEGO
-odwzorowania RGB→termika (odcięcie torsu) + segmentacja (Otsu+morfologia+największa składowa
-+ cięcie szyi) → cechy twarzy. Walidacja względem RĘCZNEGO ground truth (MANUAL_THERMAL).
-
-Uruchomienie: uv run python scripts/auto_registration_probe.py
-"""
+"""Diagnostyka auto-korejestracji RGB↔termika (subject01/s1) vs ręczny GT."""
 
 import os
 import sys

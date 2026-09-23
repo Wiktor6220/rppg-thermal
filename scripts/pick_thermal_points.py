@@ -1,12 +1,4 @@
-"""scripts/pick_thermal_points.py — ręczny wybór punktów termicznych klikaniem (narzędzie).
-
-Wyświetla pierwszą klatkę termiczną nagrania w pełnej rozdzielczości (matplotlib) i zbiera
-N kliknięć przez `ginput`, w kolejności etykiet z LABELS. Na stdout wypisuje tablicę
-THERMAL_POINTS gotową do wklejenia do scripts/probe_registration.py.
-
-Narzędzie interaktywne (wymaga GUI) — uruchamiane ręcznie, NIE zapisuje do src/.
-Uruchomienie: uv run python scripts/pick_thermal_points.py [--subject S] [--scenario SC]
-"""
+"""Interaktywne klikanie punktów na klatce termicznej (ginput → stdout dla probe_registration)."""
 
 import argparse
 import sys

@@ -47,26 +47,19 @@ def test_method_rejects_wrong_shape(method_fn):
         method_fn(np.zeros((100, 2)), FS_TEST)
 
 
-# --- Trudny sygnał: różnicowanie GREEN vs CHROM/POS przez SNR i odporność na artefakt ---
-
 HARD_SEEDS = [0, 1, 2, 3, 4]
 
 
 @pytest.mark.parametrize("seed", HARD_SEEDS)
 def test_chrom_pos_outperform_green_on_common_mode_artifact(seed):
-    """Na trudnym sygnale ze wspólnym artefaktem w paśmie CHROM/POS mają wyższe SNR niż GREEN.
-
-    Na czystym sinusie wszystkie metody dają identyczny wynik (błąd 0). Różnicę widać
-    dopiero przy wspólnym multiplikatywnym artefakcie jasności w paśmie tętna, który
-    CHROM/POS znoszą w projekcji chrominancji, a GREEN przepuszcza.
-    """
+    """CHROM/POS: wyższe SNR niż GREEN na trudnym sygnale z artefaktem w paśmie tętna."""
     rgb, _ = generate_hard_synthetic_rgb(fs=FS_TEST, duration_s=30.0, hr_bpm=TRUE_HR_BPM, seed=seed)
 
     snr_green = snr_rppg(green(rgb, FS_TEST), FS_TEST, TRUE_HR_BPM)
     snr_chrom = snr_rppg(chrom(rgb, FS_TEST), FS_TEST, TRUE_HR_BPM)
     snr_pos = snr_rppg(pos(rgb, FS_TEST), FS_TEST, TRUE_HR_BPM)
 
-    # Margines 3 dB — wyraźnie ponad rozrzut między ziarnami (patrz probe w historii).
+    # Margines 3 dB ponad rozrzut między seedami.
     assert snr_chrom > snr_green + 3.0
     assert snr_pos > snr_green + 3.0
 
@@ -82,5 +75,5 @@ def test_chrom_pos_recover_hr_where_green_fails(seed):
 
     assert abs(hr_chrom - TRUE_HR_BPM) <= TOLERANCE_BPM
     assert abs(hr_pos - TRUE_HR_BPM) <= TOLERANCE_BPM
-    # GREEN zostaje przyciągnięty do artefaktu (~96 bpm) — potwierdza różnicę metod.
+    # GREEN przyciągany do częstości artefaktu (~96 bpm).
     assert abs(hr_green - TRUE_HR_BPM) > TOLERANCE_BPM

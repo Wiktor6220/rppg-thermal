@@ -1,20 +1,4 @@
-"""scripts/probe_registration.py — DIAGNOSTYKA korejestracji RGB↔termika (rozdz. 4.4).
-
-Tylko podgląd — NIE liczy modułu, nie rusza extract.py ani src/. Bierze JEDNĄ parę klatek
-RGB+termika z tej samej chwili (parowanie po CZASIE; fps 29.97 vs 30.0) z subject01/s1 i:
-
-1. Punkty po stronie RGB wyznacza AUTOMATYCZNIE — landmarki twarzy (make_cropping_detector,
-   ta sama ścieżka detekcji co w potoku).
-2. Odpowiadające punkty termiczne są stałą (THERMAL). Punkty bez współrzędnych termicznych
-   (None) są POMIJANE w dopasowaniu — czekają na wartości odczytane z gridu.
-3. Dopasowuje TYLKO affine (estimateAffine2D, LS) termika->RGB; residua per punkt, RMS, max,
-   oraz osobno RMS na rejonach PERFUZJI (skronie/policzki/czoło) — to metryka decydująca
-   o masce ROI.
-4. Leave-one-out: dla każdego punktu affine na pozostałych → błąd predykcji na wyłączonym.
-5. Zapisuje nakładkę affine (RGB + termika w czerwonym, alpha 0.5).
-
-Uruchomienie: uv run python scripts/probe_registration.py
-"""
+"""Diagnostyka affine termika→RGB na jednej klatce (landmarki + stałe punkty termiczne)."""
 
 import sys
 from pathlib import Path

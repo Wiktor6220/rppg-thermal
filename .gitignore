@@ -24,4 +24,4 @@ CONTEXT.md
 notebooks/
 
 generate_results.py
-generete_test_report.py
+generate_tests_report.py

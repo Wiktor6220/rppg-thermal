@@ -1,11 +1,4 @@
-"""Walidacja estymaty HR względem referencji: podział na okna, MAE, RMSE per okno.
-
-Zgodnie z CONTEXT.md walidacja odbywa się w przesuwanych oknach (np. 10 s) —
-HR liczone jest osobno w każdym oknie i porównywane z referencją, zamiast
-sprowadzać cały nagrany sygnał do jednej liczby. Okna z przewagą nieważnych
-klatek (wg wektora `valid[]` z roi.py) są pomijane w metrykach — odrzucane są
-OKNA, nigdy pojedyncze klatki (CLAUDE.md).
-"""
+"""Walidacja HR w przesuwanych oknach: MAE, RMSE per okno."""
 
 from collections.abc import Callable
 
@@ -52,10 +45,7 @@ def split_into_windows(
 
 
 def compute_mae(estimated: np.ndarray, reference: np.ndarray) -> float:
-    """Liczy średni błąd bezwzględny (MAE) między estymatami HR a referencją.
-
-    Pary, w których estymata lub referencja to NaN (okno pominięte/nieudane),
-    są ignorowane — zgodnie z zasadą odrzucania okien, a nie pojedynczych klatek.
+    """MAE między estymatami HR a referencją (pary z NaN pomijane).
 
     Args:
         estimated: 1D tablica estymat HR (per okno, bpm), może zawierać NaN.
@@ -148,40 +138,11 @@ def validate_signal(
     hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
     reference_hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_peaks,
 ) -> dict:
-    """Waliduje sygnał rPPG względem referencji w przesuwanych oknach czasowych.
-
-    Dla każdego okna: sprawdza odsetek ważnych klatek (`valid[]`) — okna z
-    przewagą nieważnych klatek (poniżej `min_valid_ratio`) są pomijane w
-    metrykach. Dla pozostałych okien estymuje HR z sygnału (`hr_estimator`) i
-    z referencji (`reference_hr_estimator`), po detrendzie i filtracji
-    pasmowej każdego okna z osobna. Metryki (MAE, RMSE) liczone są per okno,
-    nie jako jedna liczba na cały sygnał.
-
-    Args:
-        estimated_signal: 1D sygnał rPPG (wyjście `methods.py`), fs próbek.
-        reference_signal: 1D sygnał referencyjny (np. PPG), tej samej długości
-            i częstotliwości próbkowania co `estimated_signal`.
-        fs: częstotliwość próbkowania obu sygnałów (Hz).
-        valid: 1D tablica bool długości sygnału — wynik `roi.track_roi_across_frames`.
-            Gdy None, wszystkie klatki uznawane są za ważne.
-        window_s: długość okna w sekundach. Domyślnie `config.VALIDATION_WINDOW_SEC`.
-        step_s: krok przesunięcia okna w sekundach. Domyślnie `config.VALIDATION_STEP_SEC`.
-        min_valid_ratio: minimalny odsetek ważnych klatek wymagany, by okno nie
-            zostało pominięte. Domyślnie `config.MIN_VALID_RATIO`.
-        hr_estimator: funkcja estymująca HR z okna sygnału estymowanego
-            (np. `estimate.estimate_hr_welch` lub `estimate.estimate_hr_peaks`).
-        reference_hr_estimator: funkcja estymująca HR z okna sygnału referencyjnego.
+    """HR per okno (detrend + filtr na oknie); okna z niskim valid[] pomijane w metrykach.
 
     Returns:
-        Słownik z wynikami per okno oraz zagregowanymi metrykami:
-            "window_start_s": czas początku każdego okna (s),
-            "estimated_hr_bpm": estymaty HR per okno (NaN dla pominiętych),
-            "reference_hr_bpm": referencyjne HR per okno (NaN dla pominiętych),
-            "error_bpm": błąd bezwzględny per okno (NaN dla pominiętych),
-            "window_used": maska bool, które okna weszły do metryk,
-            "n_windows_total": liczba wszystkich okien,
-            "n_windows_used": liczba okien uwzględnionych w metrykach,
-            "mae_bpm", "rmse_bpm": zagregowane metryki po użytych oknach.
+        Słownik: window_start_s, estimated_hr_bpm, reference_hr_bpm, error_bpm,
+        window_used, n_windows_total, n_windows_used, mae_bpm, rmse_bpm.
     """
     estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
     reference_signal = np.asarray(reference_signal, dtype=np.float64)
@@ -207,7 +168,7 @@ def validate_signal(
 
     for i, (start, end) in enumerate(bounds):
         if _window_valid_ratio(valid, start, end) < min_valid_ratio:
-            continue  # okno z przewagą nieważnych klatek — pomijamy w metrykach
+            continue  # za mało valid[] w oknie
 
         est_hr = _estimate_window_hr(estimated_signal[start:end], fs, hr_estimator)
         ref_hr = _estimate_window_hr(reference_signal[start:end], fs, reference_hr_estimator)

@@ -1,13 +1,4 @@
-"""Ekstrakcja surowego sygnału rPPG z ROI oraz maskowanie termiczne wg perfuzji.
-
-Rdzeń tezy pracy: mapa termiczna (temperatura bezwzględna, bez normalizacji per
-klatka) wskazuje piksele o najwyższej perfuzji i bramkuje z nich ekstrakcję
-sygnału RGB — termika jest przestrzennym selektorem ROI, nie równoległym pomiarem.
-
-Zgodnie z CLAUDE.md ekstrakcja liczy średnią po pikselach ROI dla KAŻDEJ klatki
-(nigdy nie usuwamy klatki — oś czasu ma stały krok). Wektor `valid[]` służy tylko
-do późniejszego odrzucania OKIEN w walidacji.
-"""
+"""Ekstrakcja śladu RGB z ROI i maskowanie perfuzji z termiki."""
 
 import numpy as np
 
@@ -33,11 +24,7 @@ def _roi_to_mask(roi_position: np.ndarray, height: int, width: int) -> np.ndarra
 
 
 def _mean_rgb_in_mask(rgb_frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Średnia R, G, B po pikselach maski; przy pustej masce — średnia po całej klatce.
-
-    Nigdy nie zwraca NaN i nie „gubi" klatki — pusta maska degraduje się do średniej
-    z całej klatki, aby zachować stały krok osi czasu (wymóg FFT/Welcha).
-    """
+    """Średnia R, G, B po pikselach maski; pusta maska → średnia po całej klatce."""
     if mask.any():
         return rgb_frame[mask].mean(axis=0)
     return rgb_frame.reshape(-1, rgb_frame.shape[-1]).mean(axis=0)
@@ -54,17 +41,15 @@ def _check_lengths(n_frames: int, roi_positions: list, valid: np.ndarray) -> Non
 def extract_rgb_trace(
     rgb_frames: np.ndarray, roi_positions: list[np.ndarray], valid: np.ndarray
 ) -> np.ndarray:
-    """Liczy średnie wartości kanałów RGB w obrębie ROI dla każdej klatki.
+    """Średnie R, G, B w ROI dla każdej klatki.
 
     Args:
-        rgb_frames: sekwencja klatek RGB o kształcie (N, H, W, 3).
-        roi_positions: lista długości N z maską (H, W) lub bboxem ROI dla każdej klatki
-            (wynik `roi.track_roi_across_frames`).
-        valid: 1D tablica bool długości N oznaczająca klatki z faktyczną detekcją ROI.
-            Nie służy do usuwania klatek — ekstrakcja liczona jest dla wszystkich.
+        rgb_frames: (N, H, W, 3).
+        roi_positions: maska (H, W) lub bbox na klatkę.
+        valid: bool[N] — detekcja ROI; nie usuwa klatek z ekstrakcji.
 
     Returns:
-        Tablica (N, 3) średnich wartości R, G, B w ROI dla każdej klatki.
+        (N, 3) float64.
     """
     rgb_frames = np.asarray(rgb_frames, dtype=np.float64)
     n_frames, height, width, _ = rgb_frames.shape
@@ -78,20 +63,14 @@ def extract_rgb_trace(
 
 
 def compute_perfusion_mask(thermal_frame: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
-    """Wyznacza maskę pikseli o podwyższonej perfuzji na podstawie mapy termicznej.
-
-    Działa na wartościach radiometrycznych (temperatura bezwzględna), bez
-    normalizacji per klatka. Piksel jest „wysokiej perfuzji", gdy jego temperatura
-    przekracza średnią ROI o co najmniej `PERFUSION_TEMP_STD_FACTOR` odchyleń
-    standardowych temperatury w ROI. Próg jest względny wobec rozkładu temperatury
-    w ROI (nie skalujemy ani nie normalizujemy wartości pikseli).
+    """Maska pikseli w ROI powyżej progu mean + k*std (termika, bez normalizacji per klatka).
 
     Args:
-        thermal_frame: pojedyncza klatka termiczna (H, W), wartości radiometryczne.
-        roi_mask: maska binarna ROI (H, W) ograniczająca obszar analizy.
+        thermal_frame: (H, W) wartości termiczne.
+        roi_mask: (H, W) bool.
 
     Returns:
-        Maska binarna (H, W) pikseli o podwyższonej perfuzji w obrębie ROI.
+        (H, W) bool.
     """
     thermal_frame = np.asarray(thermal_frame, dtype=np.float64)
     roi_mask = np.asarray(roi_mask, dtype=bool)
@@ -112,18 +91,16 @@ def extract_rgb_trace_thermal_gated(
     roi_positions: list[np.ndarray],
     valid: np.ndarray,
 ) -> np.ndarray:
-    """Liczy średnie RGB w ROI ograniczonym dodatkowo maską perfuzji z termiki.
+    """Średnie RGB w ROI przeciętym z maską perfuzji z termiki (termika w układzie RGB).
 
     Args:
-        rgb_frames: sekwencja klatek RGB o kształcie (N, H, W, 3).
-        thermal_frames: sekwencja klatek termicznych (N, H, W), po korekcji
-            paralaksy względem kamery RGB (warping wykonany wcześniej).
-        roi_positions: lista długości N z maską (H, W) lub bboxem ROI dla każdej klatki.
-        valid: 1D tablica bool długości N oznaczająca klatki z faktyczną detekcją ROI.
+        rgb_frames: (N, H, W, 3).
+        thermal_frames: (N, H, W) po warp termika→RGB.
+        roi_positions: maska lub bbox na klatkę.
+        valid: bool[N].
 
     Returns:
-        Tablica (N, 3) średnich wartości R, G, B w ROI zbramkowanym mapą perfuzji.
-        Gdy maska perfuzji jest pusta, degraduje się do średniej z ROI (klatka nie ginie).
+        (N, 3); przy pustej masce perfuzji — średnia po ROI.
     """
     rgb_frames = np.asarray(rgb_frames, dtype=np.float64)
     thermal_frames = np.asarray(thermal_frames, dtype=np.float64)
@@ -136,7 +113,6 @@ def extract_rgb_trace_thermal_gated(
     for i in range(n_frames):
         roi_mask = _roi_to_mask(roi_positions[i], height, width)
         perfusion_mask = compute_perfusion_mask(thermal_frames[i], roi_mask)
-        # Pusta / zbyt mała maska → pełne ROI (nie gubimy klatki, nie szumimy śladu).
         n_roi = int(roi_mask.sum())
         n_perf = int(perfusion_mask.sum())
         use_gated = n_roi > 0 and n_perf >= PERFUSION_MIN_ROI_FRAC * n_roi

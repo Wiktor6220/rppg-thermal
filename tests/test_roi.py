@@ -1,9 +1,4 @@
-"""Testy logiki śledzenia ROI i wektora valid[] — z atrapą detektora, bez MediaPipe.
-
-Sprawdzamy wyłącznie logikę przytrzymania/uzupełniania pozycji ROI przy sekwencji
-z dziurami (klatki bez detekcji). Prawdziwa detekcja (MediaPipe) nie jest tu
-wywoływana ani implementowana.
-"""
+"""Testy track_roi_across_frames z atrapą detektora (hold, valid[])."""
 
 import numpy as np
 

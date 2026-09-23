@@ -1,22 +1,4 @@
-"""scripts/auto_manual_registration.py — auto vs ręczna korejestracja na jednym nagraniu.
-
-1. Bierze jedną parę klatek (domyślnie t=0) z wybranego subject/scenario.
-2. Ty klikasz 7 punktów na termice (jak ``pick_thermal_points``).
-3. RGB-cele = landmarki MediaPipe (automatycznie).
-4. Liczy:
-   - affine **ręczną** (LS z Twoich klików),
-   - affine **auto** (``src.registration``: kontury + eye_y),
-   - residua per punkt / RMS / czoło / policzki dla obu.
-5. Zapisuje nakładki i punkty GT do ``results/registration_probe/``.
-
-Domyślnie klikasz **tylko na pierwszej klatce** (wystarczy dla s1–s4).
-Opcja ``--every N``: ponowne klikanie co N klatek (np. s5 / drift).
-
-Uruchomienie:
-    uv run python scripts/auto_manual_registration.py --subject subject01 --scenario s1_rest_rest
-    uv run python scripts/auto_manual_registration.py --subject subject02 --scenario s3_drone_move
-    uv run python scripts/auto_manual_registration.py --subject subject01 --scenario s5_approach --every 300
-"""
+"""Porównanie affine auto (registration) vs ręcznej (kliknięcia na termice); zapis do results/registration_probe/."""
 
 from __future__ import annotations
 

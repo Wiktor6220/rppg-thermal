@@ -1,11 +1,4 @@
-"""scripts/demo_io_layer.py — szybki podgląd io_layer na realnym nagraniu (tylko odczyt).
-
-Wczytuje subject01/s1_rest_rest i wypisuje dla RGB i termiki: fps, liczbę klatek,
-rozdzielczość oraz długość w sekundach. Sprawdza też kształt pierwszej klatki obu
-strumieni (bez dekodowania całości).
-
-Uruchomienie:  uv run python scripts/demo_io_layer.py
-"""
+"""Demo io_layer: metadane i pierwsza klatka RGB/termika (subject01/s1)."""
 
 import sys
 from pathlib import Path

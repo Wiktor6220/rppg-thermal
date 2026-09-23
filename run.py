@@ -1,8 +1,4 @@
-"""Skleja potok: io_layer -> roi -> extract -> methods -> estimate -> validate.
-
-Nie liczy niczego samodzielnie — wyłącznie wywołuje funkcje z `src/` w ustalonej
-kolejności. Logika modułów nie jest jeszcze zaimplementowana (patrz src/).
-"""
+"""Skleja potok: io_layer → roi → extract → methods → estimate → validate."""
 
 from src import config, estimate, extract, io_layer, methods, roi
 

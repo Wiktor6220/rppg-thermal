@@ -1,12 +1,4 @@
-"""Automatyczna korejestracja termika → RGB (kontury masek + refine linii oczu).
-
-Bez człowieka w pętli i bez ML. Landmarki MediaPipe → maska twarzy na RGB;
-na termice segmentacja jasnej plamy. Start: pełna affine z kątowo sparowanych
-konturów. Refine: przesunięcie w Y, żeby najciemniejszy pas oczu na termice
-trafił w linię oczu RGB (MediaPipe 33/263) — usuwa systematyczny bias sylwetki.
-
-``extract`` zakłada termikę już zwarpowaną do rozmiaru RGB (``warp_thermal_to_rgb``).
-"""
+"""Korejestracja termika→RGB: segmentacja, affine z konturów, refine Y linii oczu."""
 
 from __future__ import annotations
 
@@ -192,11 +184,7 @@ def thermal_eye_line(
     band_bottom: float = REG_EYE_BAND_BOTTOM,
     min_cols: int = 8,
 ) -> tuple[float, float] | None:
-    """Środek najciemniejszego wiersza w pasie oczu maski termicznej (cx, row).
-
-    Pas to ułamek wysokości maski od jej góry — celowo nie od 0, żeby nie łapać
-    ciemnej linii włosów / górnej krawędzi segmentacji.
-    """
+    """(cx, row) najciemniejszego wiersza w pasie oczu maski (REG_EYE_BAND_*)."""
     ys = np.where(mask)[0]
     if ys.size == 0:
         return None
@@ -249,11 +237,11 @@ def estimate_affine_thermal_to_rgb(
     thermal_frame: np.ndarray,
     landmarks: np.ndarray,
 ) -> tuple[np.ndarray | None, dict | str]:
-    """Estymuje pełną affine termika→RGB (kontury + refine Y linii oczu; bez HITL).
+    """Estymuje affine termika→RGB: kontury masek + refine Y linii oczu.
 
     Args:
-        rgb_frame: klatka RGB (H, W, 3) — kształt kadru; maska z landmarków.
-        thermal_frame: klatka termiczna (h, w) lub (h, w, 3) podglądu.
+        rgb_frame: klatka RGB (H, W, 3).
+        thermal_frame: klatka termiczna (h, w) lub (h, w, 3).
         landmarks: (K, 2) punkty MediaPipe w pikselach RGB.
 
     Returns:

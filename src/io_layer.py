@@ -1,15 +1,4 @@
-"""Wczytywanie nagrań wideo z realnego zbioru (dron: RGB + termika podglądowa).
-
-Zbiór bieżący: `data/subjectXX/sN_opis/subjectXX_sN_{rgb,thermal}.MP4` (+ pliki Polara
-HR/ECG, ignorowane na tym etapie). Termika to **wizualny podgląd mp4, NIE radiometryka**.
-
-Moduł tylko odczytuje klatki i metadane — nie synchronizuje, nie skaluje, nie przetwarza
-sygnału. RGB i termika mogą mieć różną rozdzielczość, fps i liczbę klatek; zwracamy te
-informacje osobno dla każdego strumienia i NIE zakładamy, że są równe.
-
-Klatki wideo są duże (RGB bywa 4K), więc domyślnie zwracamy je jako **generator**
-(leniwie, klatka po klatce), a nie jako jedną tablicę w pamięci.
-"""
+"""Wczytywanie nagrań RGB + termika (podgląd mp4), metadane i generatory klatek."""
 
 import math
 import re
@@ -113,18 +102,7 @@ def _find_stream(session_dir: Path, suffix: str) -> Path | None:
 
 
 def list_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
-    """Listuje kompletne nagrania (RGB + termika) w `data/`, pomijając niekompletne.
-
-    „Kompletne" na tym etapie oznacza obecność OBU strumieni wideo (RGB i termika) —
-    pliki Polara są tu ignorowane (synchronizacja później). Sesja bez któregoś strumienia
-    jest pomijana.
-
-    Args:
-        data_dir: katalog główny danych. Domyślnie `config.DATA_DIR`.
-
-    Returns:
-        Lista `Recording` posortowana po (subject, scenario).
-    """
+    """Nagrania z oboma strumieniami wideo (RGB + termika) w data/."""
     recordings: list[Recording] = []
     if not data_dir.is_dir():
         return recordings
@@ -233,20 +211,7 @@ def iter_video_frames(path: Path, to_rgb: bool = True) -> Iterator[np.ndarray]:
 
 
 def load_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> LoadedRecording:
-    """Wczytuje pojedyncze nagranie (RGB + termika) dla danej osoby i scenariusza.
-
-    Zwraca metadane obu strumieni od razu (szybki `probe_video`) oraz leniwy dostęp do
-    klatek (`.rgb_frames()`, `.thermal_frames()`). NIE wczytuje wszystkich klatek do
-    pamięci i NIE synchronizuje strumieni.
-
-    Args:
-        subject: identyfikator osoby, np. "subject01", "01".
-        scenario: nazwa/kod scenariusza, np. "s1_rest_rest" albo "s1".
-        data_dir: katalog główny danych. Domyślnie `config.DATA_DIR`.
-
-    Returns:
-        `LoadedRecording` z metadanymi RGB i termiki oraz generatorami klatek.
-    """
+    """Metadane obu strumieni + generatory klatek (bez pełnego wczytania do RAM)."""
     rec = find_recording(subject, scenario, data_dir)
     return LoadedRecording(
         recording=rec,
@@ -256,13 +221,7 @@ def load_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Lo
 
 
 def resize_to(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """Przeskalowuje klatkę do zadanego rozmiaru `(width, height)` przez `cv2.resize`.
-
-    UWAGA: to jest wyłącznie ZGRUBNE przeskalowanie rozdzielczości (dopasowanie liczby
-    pikseli), a NIE korejestracja obrazów ani korekcja paralaksy. Piksele RGB i termiki
-    nadal NIE są geometrycznie dopasowane — właściwe zestrojenie (warping, paralaksa)
-    to osobny moduł (rozdz. 4.4). Używać tylko do wstępnego podglądu / wspólnego rozmiaru.
-    """
+    """cv2.resize do (width, height); to nie jest korejestracja geometryczna."""
     target_w, target_h = size
     src_h, src_w = frame.shape[:2]
     if (src_w, src_h) == (target_w, target_h):
@@ -278,32 +237,10 @@ def iter_time_synced_pairs(
     match_resolution: str | None = None,
     to_rgb: bool = True,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
-    """Generator par klatek zsynchronizowanych w CZASIE (nie po numerze klatki).
-
-    RGB (≈29.97 fps) i termika (30.000 fps) mają różny fps i różną liczbę klatek, więc
-    parowanie po indeksie byłoby błędne. Zamiast tego jeden strumień jest ODNIESIENIEM
-    CZASU: iterujemy jego klatki, a dla każdej (czas `t = i / fps_ref`) dobieramy klatkę
-    drugiego strumienia NAJBLIŻSZĄ w czasie (indeks `j` minimalizujący `|j/fps_other - t|`).
-    Oba strumienie czytane są do przodu (bez losowego seekowania), więc pozostaje leniwo.
-
-    Zwraca krotki `(rgb_frame, thermal_frame, t_seconds)` — kolejność rgb/thermal jest
-    stała niezależnie od `reference`, a `t_seconds` to czas KLATKI ODNIESIENIA.
-
-    Args:
-        loaded: wynik `load_recording` (metadane obu strumieni + ścieżki).
-        reference: który strumień wyznacza oś czasu — "rgb" (domyślnie) lub "thermal".
-        match_resolution: opcjonalne zgrubne ujednolicenie rozdzielczości:
-            None  — bez skalowania (klatki w natywnych rozmiarach),
-            "rgb" — przeskaluj termikę do rozmiaru RGB,
-            "thermal" — przeskaluj RGB do rozmiaru termiki.
-            To tylko resize (patrz `resize_to`), NIE korejestracja/paralaksa (rozdz. 4.4).
-        to_rgb: konwersja klatek BGR→RGB (jak w `iter_video_frames`).
+    """Pary (rgb, thermal, t) dopasowane po czasie; reference wyznacza oś t.
 
     Yields:
-        `(rgb_frame, thermal_frame, t_seconds)` — klatki (H, W, 3) uint8 i czas [s].
-
-    Raises:
-        ValueError: gdy `reference`/`match_resolution` mają złą wartość lub fps ≤ 0.
+        rgb_frame, thermal_frame, t_seconds (czas klatki reference).
     """
     if reference not in ("rgb", "thermal"):
         raise ValueError(f"reference musi być 'rgb' albo 'thermal', otrzymano {reference!r}")
@@ -435,8 +372,7 @@ def load_polar_hr(
     return PolarHrSeries(t_s=t_s, hr_bpm=np.asarray(hrs, dtype=np.float64))
 
 
-# --- Placeholdery dla publicznych zbiorów referencyjnych (do implementacji później) ---
-# Zbiór bieżący (dron) obsługują funkcje powyżej. Poniższe są rezerwą pod UBFC/iBVP.
+# Placeholdery: UBFC / iBVP (później)
 
 
 def load_ubfc_subject(subject_dir: Path) -> tuple[np.ndarray, np.ndarray, float]:

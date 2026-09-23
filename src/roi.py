@@ -1,12 +1,4 @@
-"""Detekcja twarzy (MediaPipe Face Mesh), wybór i śledzenie ROI między klatkami.
-
-Zasada „nigdy nie usuwaj klatki": gdy ROI nie zostanie znalezione, pozycja jest
-przytrzymywana z poprzedniej klatki lub interpolowana, a klatka oznaczana jako
-nieważna w wektorze `valid[]`. Odrzucane są okna, nie pojedyncze klatki.
-
-MediaPipe importowany jest leniwie (dopiero przy pierwszej realnej detekcji), aby
-import modułu i testy jednostkowe (atrapa detektora) pozostały szybkie.
-"""
+"""Detekcja twarzy (MediaPipe), ROI i śledzenie między klatkami (hold + valid[])."""
 
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -44,12 +36,7 @@ def _suppress_stderr():
 
 
 def _get_face_landmarker():
-    """Zwraca współdzieloną instancję FaceLandmarker (Tasks API), tworzoną przy 1. użyciu.
-
-    Ten build mediapipe udostępnia tylko API Tasks (brak `solutions.face_mesh`), więc
-    detekcja wymaga pliku modelu `.task` (patrz `config.FACE_LANDMARKER_MODEL_PATH`).
-    Tryb IMAGE = każda klatka niezależnie (uczciwa miara pokrycia detekcji).
-    """
+    """Singleton FaceLandmarker (Tasks API, model .task w config)."""
     global _FACE_LANDMARKER
     if _FACE_LANDMARKER is None:
         if not FACE_LANDMARKER_MODEL_PATH.exists():
@@ -132,27 +119,7 @@ def make_cropping_detector(
     crop_sizes: tuple[int, ...] = (1000, 1300, 700, 1600),
     reacquire_from_center: bool = True,
 ) -> Callable[[np.ndarray], np.ndarray | None]:
-    """Buduje detektor „detekcja na wykadrowanym obszarze twarzy", odporny na małą twarz.
-
-    Na nagraniach z drona twarz zajmuje kilka % szerokości kadru 4K; wewnętrzny detektor
-    FaceLandmarker skaluje CAŁY obraz do ~192 px, więc tak mała twarz ginie i detekcja
-    na pełnej klatce zawodzi. Rozwiązanie: utrzymuj środek ostatnio znalezionej twarzy
-    i wykrywaj na kwadratowym wycinku wokół niego (twarz staje się dużo większą częścią
-    kadru), a punkty mapuj z powrotem do współrzędnych ORYGINAŁU.
-
-    Rozmiar twarzy zależy od dystansu (osoba dalej → mniejsza twarz → potrzebny CIAŚNIEJSZY
-    wycinek). Dlatego próbujemy kilku rozmiarów `crop_sizes` w kolejności, zaczynając od
-    ostatnio skutecznego; pierwszy z detekcją wygrywa. Detektor jest stanowy (pamięta
-    środek i skalę między klatkami) — twórz osobną instancję na nagranie. Przy całkowitej
-    utracie środek jest resetowany do centrum kadru (reakwizycja).
-
-    Args:
-        crop_sizes: boki kwadratowych wycinków (px oryginału) próbowane w kolejności.
-        reacquire_from_center: przy braku detekcji wróć do środka kadru na następną próbę.
-
-    Returns:
-        Funkcja klatka -> landmarki (K, 2) we współrzędnych oryginału albo None.
-    """
+    """Detekcja na kwadratowym wycinku wokół ostatniej twarzy (4K / mała twarz)."""
     state: dict[str, float | int | None] = {"cx": None, "cy": None, "size_idx": 0}
 
     def detector(frame: np.ndarray) -> np.ndarray | None:
@@ -216,13 +183,7 @@ def select_roi_from_landmarks(landmarks: np.ndarray, region: str) -> np.ndarray:
 def _fill_missing_roi(
     raw_roi: list[np.ndarray | None], valid: np.ndarray
 ) -> list[np.ndarray | None]:
-    """Wypełnia luki w ROI: przytrzymanie ostatniej pozycji, a luki wiodące — pierwszą znaną.
-
-    Zasada „nigdy nie usuwaj klatki": klatka bez detekcji dostaje ostatnią znaną
-    pozycję ROI (hold). Klatki przed pierwszą detekcją nie mają czego przytrzymać —
-    są uzupełniane wstecznie pierwszą wykrytą pozycją. Gdy nie ma ŻADNEJ detekcji,
-    pozycje pozostają None (nie ma czym wypełnić).
-    """
+    """Hold-last; luki wiodące — pierwsza znana pozycja."""
     n = len(raw_roi)
     filled: list[np.ndarray | None] = list(raw_roi)
 
@@ -231,12 +192,12 @@ def _fill_missing_roi(
         if valid[i]:
             last_known = raw_roi[i]
         elif last_known is not None:
-            filled[i] = last_known  # przytrzymanie ostatniej znanej pozycji
+            filled[i] = last_known
 
     first_known = next((raw_roi[i] for i in range(n) if valid[i]), None)
     if first_known is not None:
         for i in range(n):
-            if filled[i] is None:  # luki wiodące (przed pierwszą detekcją)
+            if filled[i] is None:
                 filled[i] = first_known
     return filled
 
@@ -247,29 +208,10 @@ def track_roi_across_frames(
     roi_builder: Callable[[np.ndarray, str], np.ndarray] = select_roi_from_landmarks,
     region: str = "forehead",
 ) -> tuple[list[np.ndarray | None], np.ndarray]:
-    """Śledzi ROI w sekwencji klatek, stosując detekcję landmarków i śledzenie między nimi.
-
-    Sama logika śledzenia jest niezależna od konkretnego detektora — `detector`
-    i `roi_builder` są wstrzykiwane (domyślnie MediaPipe Face Mesh). Dzięki temu
-    logikę przytrzymania/`valid[]` można testować na atrapie detektora, bez
-    uruchamiania MediaPipe. Przy braku detekcji ROI na danej klatce: przytrzymuje
-    ostatnią znaną pozycję (luki wiodące — pierwsza znana), nigdy nie usuwa klatki.
-
-    Klatki są konsumowane leniwie (iterowalne), więc można podać generator z io_layer
-    i nie materializować całego (dużego, 4K) wideo w pamięci.
-
-    Args:
-        frames: iterowalne klatek RGB (H, W, 3) — np. generator z `io_layer`.
-        detector: funkcja klatka -> landmarki (N, 2) lub None przy braku detekcji.
-        roi_builder: funkcja (landmarki, region) -> maska/bbox ROI.
-        region: nazwa obszaru ROI przekazywana do `roi_builder`.
+    """ROI per klatka; detector/roi_builder wstrzykiwalne (testy bez MediaPipe).
 
     Returns:
-        Krotka (roi_positions, valid):
-            roi_positions: lista długości N z maską/bboxem ROI dla każdej klatki
-                (None tylko, gdy w całej sekwencji nie było ani jednej detekcji).
-            valid: 1D tablica bool długości N — True, gdy ROI pochodzi z faktycznej
-                detekcji, False, gdy zostało przytrzymane/uzupełnione.
+        (roi_positions, valid) — valid True tylko przy faktycznej detekcji.
     """
     raw_roi: list[np.ndarray | None] = []
     valid_list: list[bool] = []

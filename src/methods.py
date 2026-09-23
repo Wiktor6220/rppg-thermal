@@ -1,12 +1,4 @@
-"""Metody rPPG jako czyste funkcje sygnał→sygnał (GREEN, CHROM, POS, ICA).
-
-Bez wczytywania plików, bez rysowania — dzięki temu testowalne na sygnale
-syntetycznym o znanej częstości. ICA/PCA mają sens tylko na wielu kanałach
-(3x RGB lub wiele ROI), nigdy na sygnale 1D.
-
-Normalizacja zawsze po osi czasu (np. `x / x.mean()` po całym oknie), nigdy
-per pojedyncza klatka — zgodnie z CLAUDE.md.
-"""
+"""Metody rPPG: GREEN, CHROM, POS, ICA (sygnał→sygnał, bez I/O)."""
 
 import numpy as np
 from scipy.signal import periodogram
@@ -38,8 +30,7 @@ def green(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
             (zachowana dla spójności interfejsu z pozostałymi metodami).
 
     Returns:
-        1D sygnał rPPG długości N — kanał zielony znormalizowany po osi czasu
-        (`G / mean(G) - 1`, normalizacja po całym oknie, nigdy per klatka).
+        1D sygnał długości N (G znormalizowane po osi czasu).
     """
     rgb_trace = _validate_rgb_trace(rgb_trace)
     g = rgb_trace[:, 1]
@@ -47,24 +38,7 @@ def green(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
 
 
 def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
-    """Metoda CHROM (de Haan & Jeanne, 2013) — sygnał rPPG odporny na ruch i oświetlenie.
-
-    Sygnały chrominancji Xs = 3*Rn - 2*Gn, Ys = 1.5*Rn + Gn - 1.5*Bn liczone są
-    w przesuwanym oknie o długości ~1.6 s, gdzie Rn/Gn/Bn to kanały znormalizowane
-    przez swoją średnią w obrębie okna (temporal normalization, nigdy per klatka).
-    W wariancie kanonicznym (de Haan & Jeanne, 2013) Xs i Ys są przed wyznaczeniem
-    alpha filtrowane pasmowo do zakresu HR — dzięki temu współczynnik
-    alpha = std(Xf)/std(Yf) dostraja się do składowej pulsacyjnej, a nie do wolnego
-    dryfu czy szumu poza pasmem. Sygnał chrominancji to Xf - alpha*Yf. Okna łączone
-    są metodą overlap-add.
-
-    Args:
-        rgb_trace: tablica (N, 3) średnich wartości R, G, B w czasie.
-        fs: częstotliwość próbkowania sygnału (Hz).
-
-    Returns:
-        1D sygnał rPPG długości N.
-    """
+    """CHROM (de Haan & Jeanne, 2013): okna ~1.6 s, filtracja Xs/Ys przed alpha, overlap-add."""
     rgb_trace = _validate_rgb_trace(rgb_trace)
     n_samples = rgb_trace.shape[0]
     window_len = max(2, min(n_samples, int(round(_WINDOW_SEC * fs))))
@@ -78,7 +52,7 @@ def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
         x_s = 3.0 * r_n - 2.0 * g_n
         y_s = 1.5 * r_n + g_n - 1.5 * b_n
 
-        # Kanoniczny CHROM: filtracja pasmowa Xs/Ys w oknie przed policzeniem alpha.
+        # Filtracja pasmowa Xs/Ys przed alpha.
         x_f = bandpass_filter(x_s, fs)
         y_f = bandpass_filter(y_s, fs)
 
@@ -92,21 +66,7 @@ def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
 
 
 def pos(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
-    """Metoda POS — Plane-Orthogonal-to-Skin (Wang et al., 2017).
-
-    W przesuwanym oknie o długości ~1.6 s kanały normalizowane są przez swoją
-    średnią w obrębie okna (temporal normalization). Projekcja na płaszczyznę
-    ortogonalną do tonu skóry: S1 = Gn - Bn, S2 = Gn + Bn - 2*Rn, a sygnał
-    pulsacyjny to h = S1 + alpha*S2, gdzie alpha = std(S1)/std(S2). Okna
-    łączone są metodą overlap-add.
-
-    Args:
-        rgb_trace: tablica (N, 3) średnich wartości R, G, B w czasie.
-        fs: częstotliwość próbkowania sygnału (Hz).
-
-    Returns:
-        1D sygnał rPPG długości N.
-    """
+    """POS (Wang et al., 2017): okna ~1.6 s, overlap-add."""
     rgb_trace = _validate_rgb_trace(rgb_trace)
     n_samples = rgb_trace.shape[0]
     window_len = max(2, min(n_samples, int(round(_WINDOW_SEC * fs))))

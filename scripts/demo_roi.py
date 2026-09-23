@@ -1,19 +1,4 @@
-"""scripts/demo_roi.py — sprawdzenie detekcji twarzy i stabilności ROI na realnym RGB.
-
-Przetwarza JEDNO nagranie RGB (domyślnie subject01/s1_rest_rest — baseline), używa
-przetestowanej logiki śledzenia z `roi.track_roi_across_frames` (detekcja + `valid[]` +
-przytrzymanie) z detektorem „detekcja na wycinku twarzy" (`make_cropping_detector`),
-odpornym na małą twarz w kadrze 4K z drona. Zapisuje:
-  (a) kilkanaście przykładowych klatek z narysowanym ROI (czoło + policzki)
-      do results/roi_preview/,
-  (b) statystykę pokrycia detekcji: % klatek z wykrytą twarzą, histogram długości
-      przerw, liczbę klatek valid vs invalid.
-
-ROI liczone jest na współrzędnych ORYGINAŁU; podgląd zapisujemy pomniejszony.
-NIE robi ekstrakcji sygnału ani maski termicznej — to kolejne kroki.
-
-Uruchomienie:  uv run python scripts/demo_roi.py
-"""
+"""Podgląd detekcji ROI na jednym nagraniu RGB; statystyka valid[] → results/roi_preview/."""
 
 import argparse
 import os
