@@ -62,6 +62,8 @@ AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s5_approach": 5,
 }
 AFFINE_EVERY_DEFAULT: int = 30
+# Ile udanych estymat affine zebrać na początku w trybie fixed-median.
+AFFINE_FIXED_MEDIAN_N: int = 30
 
 # --- Korejestracja termika → RGB (registration.py) ---
 REG_NOMINAL_SCALE: float = 0.52

@@ -34,11 +34,19 @@ from src import estimate, methods, validate  # noqa: E402
 from src.config import (  # noqa: E402
     AFFINE_EVERY_BY_SCENARIO,
     AFFINE_EVERY_DEFAULT,
+    AFFINE_FIXED_MEDIAN_N,
     BAND_HIGH_HZ,
     BAND_LOW_HZ,
-    PERFUSION_MIN_ROI_FRAC,
-    PERFUSION_TEMP_STD_FACTOR,
     RESULTS_DIR,
+    VALIDATION_WINDOW_SEC,
+)
+from src.extract import (  # noqa: E402
+    affine_translation_iqr_px,
+    gated_means_per_frame_from_samples,
+    gated_means_per_window_from_samples,
+    mean_rgb_in_mask,
+    median_affine,
+    sample_roi_temps_via_affine,
 )
 from src.io_layer import list_recordings, load_recording, load_reference_hr  # noqa: E402
 from src.registration import (  # noqa: E402
@@ -97,6 +105,24 @@ def _parse_args() -> argparse.Namespace:
             "Wyniki trafiają do …/<scenario>_manual/ (nie nadpisują przebiegu auto)."
         ),
     )
+    parser.add_argument(
+        "--affine-mode",
+        choices=("refresh", "fixed-median"),
+        default="refresh",
+        help=(
+            "refresh = odświeżanie co N klatek (domyślne, obecna ścieżka); "
+            "fixed-median = mediana z pierwszych udanych estymat, stała na całe nagranie."
+        ),
+    )
+    parser.add_argument(
+        "--mask-mode",
+        choices=("per-frame", "per-window"),
+        default="per-frame",
+        help=(
+            "per-frame = maska/fallback co klatkę (domyślne); "
+            "per-window = jeden próg i decyzja gated na okno 10 s."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -149,6 +175,7 @@ def _fit_affine_from_gt(landmarks: np.ndarray, gt: dict) -> np.ndarray:
     )
     return matrix.astype(np.float64)
 
+
 def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     y0, x0, y1, x1 = (int(v) for v in bbox)
     mask = np.zeros(shape, dtype=bool)
@@ -161,57 +188,10 @@ def _region_boxes(landmarks: np.ndarray) -> dict[str, np.ndarray]:
     return {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS_EXTRACT}
 
 
-def _mean_rgb(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    if mask.any():
-        return frame[mask].mean(axis=0).astype(np.float64)
-    return frame.reshape(-1, 3).mean(axis=0).astype(np.float64)
-
-
 def _thermal_gray(thermal: np.ndarray) -> np.ndarray:
     if thermal.ndim == 2:
         return thermal.astype(np.float32)
     return cv2.cvtColor(thermal, cv2.COLOR_RGB2GRAY).astype(np.float32)
-
-
-def _gated_mean_rgb(
-    rgb: np.ndarray,
-    thermal_gray: np.ndarray,
-    affine_th_to_rgb: np.ndarray,
-    roi_mask: np.ndarray,
-) -> np.ndarray:
-    ys, xs = np.where(roi_mask)
-    if ys.size == 0:
-        return _mean_rgb(rgb, roi_mask)
-
-    inv = cv2.invertAffineTransform(affine_th_to_rgb.astype(np.float32)).astype(np.float64)
-    pts_th = apply_affine(inv, np.column_stack([xs.astype(np.float64), ys.astype(np.float64)]))
-    th_h, th_w = thermal_gray.shape[:2]
-    inside = (
-        (pts_th[:, 0] >= 0)
-        & (pts_th[:, 0] < th_w - 1)
-        & (pts_th[:, 1] >= 0)
-        & (pts_th[:, 1] < th_h - 1)
-    )
-    if not np.any(inside):
-        return _mean_rgb(rgb, roi_mask)
-
-    map_x = pts_th[inside, 0].astype(np.float32).reshape(1, -1)
-    map_y = pts_th[inside, 1].astype(np.float32).reshape(1, -1)
-    temps = cv2.remap(
-        thermal_gray,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ).ravel()
-    thr = float(temps.mean() + PERFUSION_TEMP_STD_FACTOR * temps.std())
-    keep = temps >= thr
-    n_roi = int(inside.sum())
-    n_keep = int(np.count_nonzero(keep))
-    if n_roi == 0 or n_keep < PERFUSION_MIN_ROI_FRAC * n_roi:
-        return _mean_rgb(rgb, roi_mask)
-    return rgb[ys[inside][keep], xs[inside][keep]].mean(axis=0).astype(np.float64)
 
 
 def _process_signal(rgb_trace: np.ndarray, fs: float, method_fn) -> tuple[np.ndarray, float]:
@@ -221,100 +201,221 @@ def _process_signal(rgb_trace: np.ndarray, fs: float, method_fn) -> tuple[np.nda
     return cleaned, hr
 
 
-def _out_dir(subject: str, scenario: str, manual: bool = False) -> Path:
-    suffix = "_manual" if manual else ""
+def _out_dir(
+    subject: str,
+    scenario: str,
+    manual: bool = False,
+    affine_mode: str = "refresh",
+    mask_mode: str = "per-frame",
+) -> Path:
+    """Katalog wyników; warianty P1 dostają osobny suffix, żeby nie nadpisać baseline."""
+    parts: list[str] = []
+    if manual:
+        parts.append("manual")
+    if affine_mode != "refresh":
+        parts.append(affine_mode.replace("-", ""))
+    if mask_mode != "per-frame":
+        parts.append(mask_mode.replace("-", ""))
+    suffix = ("_" + "_".join(parts)) if parts else ""
     return OUT_ROOT / subject / f"{scenario}{suffix}"
+
+
+def _collect_fixed_median_affine(
+    loaded,
+    detector,
+    n_target: int = AFFINE_FIXED_MEDIAN_N,
+) -> tuple[np.ndarray | None, list[np.ndarray]]:
+    """Pass 1: zbiera udane estymaty affine z początku nagrania → mediana."""
+    samples: list[np.ndarray] = []
+    for rgb, thermal, _ in loaded.synced_pairs(reference="rgb"):
+        landmarks = detector(rgb)
+        if landmarks is None:
+            continue
+        new_affine, _info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
+        if new_affine is None:
+            continue
+        samples.append(new_affine.astype(np.float64))
+        if len(samples) >= n_target:
+            break
+    if not samples:
+        return None, []
+    return median_affine(samples), samples
 
 
 def run_one(
     subject: str,
     scenario: str,
     manual_gt: Path | None = None,
+    affine_mode: str = "refresh",
+    mask_mode: str = "per-frame",
 ) -> list[dict]:
     """Przelicza jedno nagranie; zwraca wiersze wyników i zapisuje je lokalnie.
 
-    ``manual_gt``: jeśli podane, gated używa **stałej** affine z klikniętych punktów
-    (bez odświeżania auto) — eksperyment rozdzielający warping vs maskę.
+    ``manual_gt``: stała affine z klikniętych punktów (nadpisuje ``affine_mode``).
+    ``affine_mode``: refresh | fixed-median.
+    ``mask_mode``: per-frame | per-window.
     """
     loaded = load_recording(subject, scenario)
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
     use_manual = manual_gt is not None
+    if use_manual:
+        affine_mode = "manual"
     affine_every = _affine_every(scenario)
     print(f"\n{'=' * 60}")
     print(f"Nagranie: {subject}/{scenario}  {n_frames} klatek @ {fs:.3f} fps")
+
+    detector = make_cropping_detector()
+    gt = None
+    fixed_affine: np.ndarray | None = None
+    affine_samples: list[np.ndarray] = []
+
     if use_manual:
         print(f"Affine: RĘCZNA stała z GT  ({manual_gt})")
         gt = json.loads(manual_gt.read_text(encoding="utf-8"))
+    elif affine_mode == "fixed-median":
+        print(
+            f"Affine: FIXED-MEDIAN (cel {AFFINE_FIXED_MEDIAN_N} udanych estymat z początku)"
+        )
+        fixed_affine, affine_samples = _collect_fixed_median_affine(loaded, detector)
+        if fixed_affine is None:
+            print("  [warn] brak udanych affine — gated = plain")
+        else:
+            iqr_x, iqr_y = affine_translation_iqr_px(affine_samples)
+            print(
+                f"  Mediana z {len(affine_samples)} estymat; "
+                f"IQR tx={iqr_x:.1f} px, ty={iqr_y:.1f} px"
+            )
+        # Nowy przebieg wideo po pass 1
+        loaded = load_recording(subject, scenario)
     else:
-        print(f"Affine: AUTO, odświeżana co {affine_every} klatek")
-        gt = None
+        print(f"Affine: REFRESH co {affine_every} klatek")
 
-    detector = make_cropping_detector()
-    # Ekstrakcja: forehead + L/R. Raport tylko: forehead + cheeks (= średnia L+R).
+    print(f"Maska: {mask_mode}")
+
     plain_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
-    gated_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+    rgb_pix: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+    temps_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
     valid_list: list[bool] = []
 
-    affine = None
+    affine = fixed_affine
     last_boxes: dict[str, np.ndarray] | None = None
-    n_affine_ok = 0
+    pending: list[tuple[np.ndarray, np.ndarray]] = []
+    n_affine_ok = len(affine_samples) if affine_mode == "fixed-median" else 0
     n_affine_fail = 0
+    n_leading_filled = 0
+    refresh_samples: list[np.ndarray] = []
+
+    def _append_frame(
+        rgb: np.ndarray,
+        thermal: np.ndarray,
+        boxes: dict[str, np.ndarray],
+        detected: bool,
+    ) -> None:
+        nonlocal affine, n_affine_ok, n_affine_fail
+        valid_list.append(detected)
+        h, w = rgb.shape[:2]
+        th_gray = _thermal_gray(thermal)
+        for region in REGIONS_EXTRACT:
+            roi_mask = _bbox_to_mask(boxes[region], (h, w))
+            plain = mean_rgb_in_mask(rgb, roi_mask)
+            plain_lists[region].append(plain)
+            if affine is None:
+                rgb_pix[region].append(None)
+                temps_lists[region].append(None)
+                continue
+            ys, xs, tvals = sample_roi_temps_via_affine(th_gray, affine, roi_mask)
+            if tvals.size == 0:
+                rgb_pix[region].append(None)
+                temps_lists[region].append(None)
+            else:
+                rgb_pix[region].append(rgb[ys, xs].astype(np.float64))
+                temps_lists[region].append(tvals)
 
     print("Przebieg synced RGB+termika...", flush=True)
     for i, (rgb, thermal, _) in enumerate(loaded.synced_pairs(reference="rgb")):
         landmarks = detector(rgb)
         if landmarks is not None:
             boxes = _region_boxes(landmarks)
-            last_boxes = boxes
-            valid_list.append(True)
-            if use_manual:
-                if affine is None:
-                    try:
-                        affine = _fit_affine_from_gt(landmarks, gt)
-                        n_affine_ok = 1
-                    except Exception as exc:  # noqa: BLE001
-                        n_affine_fail += 1
-                        if i == 0:
-                            print(f"  [warn] ręczna affine: {exc}")
-            elif affine is None or (i % affine_every == 0):
-                new_affine, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
-                if new_affine is not None:
-                    affine = new_affine
-                    n_affine_ok += 1
-                else:
+            if use_manual and affine is None:
+                try:
+                    affine = _fit_affine_from_gt(landmarks, gt)
+                    n_affine_ok = 1
+                except Exception as exc:  # noqa: BLE001
                     n_affine_fail += 1
                     if i == 0:
-                        print(f"  [warn] affine na klatce 0: {info}")
+                        print(f"  [warn] ręczna affine: {exc}")
+            elif affine_mode == "refresh":
+                if affine is None or (i % affine_every == 0):
+                    new_affine, info = estimate_affine_thermal_to_rgb(
+                        rgb, thermal, landmarks
+                    )
+                    if new_affine is not None:
+                        affine = new_affine.astype(np.float64)
+                        n_affine_ok += 1
+                        refresh_samples.append(affine)
+                    else:
+                        n_affine_fail += 1
+                        if i == 0:
+                            print(f"  [warn] affine na klatce 0: {info}")
+
+            if last_boxes is None and pending:
+                for pr, pt in pending:
+                    _append_frame(pr, pt, boxes, detected=False)
+                    n_leading_filled += 1
+                pending.clear()
+            last_boxes = boxes
+            _append_frame(rgb, thermal, boxes, detected=True)
         else:
-            valid_list.append(False)
-            boxes = last_boxes
-
-        if boxes is None:
-            full = rgb.reshape(-1, 3).mean(axis=0)
-            for region in REGIONS_EXTRACT:
-                plain_lists[region].append(full)
-                gated_lists[region].append(full)
-            continue
-
-        h, w = rgb.shape[:2]
-        th_gray = _thermal_gray(thermal)
-        for region in REGIONS_EXTRACT:
-            roi_mask = _bbox_to_mask(boxes[region], (h, w))
-            plain_lists[region].append(_mean_rgb(rgb, roi_mask))
-            if affine is None:
-                gated_lists[region].append(plain_lists[region][-1])
+            if last_boxes is None:
+                pending.append((rgb, thermal))
             else:
-                gated_lists[region].append(
-                    _gated_mean_rgb(rgb, th_gray, affine, roi_mask)
-                )
+                _append_frame(rgb, thermal, last_boxes, detected=False)
 
         if (i + 1) % 200 == 0 or i + 1 == n_frames:
             print(f"  klatka {i + 1}/{n_frames}", flush=True)
 
+    # Koniec nagrania bez żadnej detekcji — średnia z całej klatki (ostateczność).
+    if last_boxes is None and pending:
+        print(
+            f"  [warn] brak detekcji twarzy w całym nagraniu "
+            f"({len(pending)} klatek → średnia z całej klatki)"
+        )
+        for pr, pt in pending:
+            full = pr.reshape(-1, 3).mean(axis=0).astype(np.float64)
+            valid_list.append(False)
+            for region in REGIONS_EXTRACT:
+                plain_lists[region].append(full)
+                rgb_pix[region].append(None)
+                temps_lists[region].append(None)
+
+    if affine_mode == "refresh" and refresh_samples:
+        iqr_x, iqr_y = affine_translation_iqr_px(refresh_samples)
+        print(f"Affine refresh: IQR tx={iqr_x:.1f} px, ty={iqr_y:.1f} px "
+              f"(n={len(refresh_samples)})")
+
     valid = np.array(valid_list, dtype=bool)
     plain_ex = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
-    gated_ex = {r: np.asarray(v, dtype=np.float64) for r, v in gated_lists.items()}
+    gated_ex: dict[str, np.ndarray] = {}
+    fallback_fracs: dict[str, float] = {}
+    for region in REGIONS_EXTRACT:
+        plain_arr = plain_ex[region]
+        if mask_mode == "per-window":
+            gated_arr, fb = gated_means_per_window_from_samples(
+                rgb_pix[region],
+                temps_lists[region],
+                plain_arr,
+                fs=fs,
+                window_s=VALIDATION_WINDOW_SEC,
+            )
+        else:
+            gated_arr, fb = gated_means_per_frame_from_samples(
+                rgb_pix[region], temps_lists[region], plain_arr
+            )
+        gated_ex[region] = gated_arr
+        fallback_fracs[region] = float(np.mean(fb)) if len(fb) else float("nan")
+
+    fallback_pct = float(np.nanmean([fallback_fracs[r] for r in REGIONS_EXTRACT]) * 100.0)
     plain = {
         "forehead": plain_ex["forehead"],
         "cheeks": 0.5 * (plain_ex["left_cheek"] + plain_ex["right_cheek"]),
@@ -326,6 +427,10 @@ def run_one(
     print(
         f"Pokrycie detekcji: {100.0 * valid.mean():.1f}%  "
         f"({int(valid.sum())}/{valid.size}); affine OK/fail: {n_affine_ok}/{n_affine_fail}"
+    )
+    print(
+        f"Leading ROI fill: {n_leading_filled} klatek; "
+        f"gated fallback: {fallback_pct:.1f}% klatek"
     )
 
     polar, ref_src = load_reference_hr(subject, scenario)
@@ -359,13 +464,13 @@ def run_one(
             clean_g = estimate.bandpass_filter(estimate.detrend_signal(sig_g), fs)
             hr_p = estimate.estimate_hr_welch(clean_p, fs)
             hr_g = estimate.estimate_hr_welch(clean_g, fs)
-            # ΔSNR tylko vs referencja (okna); bez ref → NaN (nie vs estymaty plain).
             snr_p = float("nan")
             snr_g = float("nan")
             row = {
                 "subject": subject,
                 "scenario": scenario,
-                "affine_mode": "manual" if use_manual else "auto",
+                "affine_mode": affine_mode,
+                "mask_mode": mask_mode,
                 "region": region,
                 "method": name,
                 "hr_plain": float(hr_p),
@@ -381,11 +486,12 @@ def run_one(
                 "n_windows": 0,
                 "ref_src": ref_src if polar is not None else "none",
                 "valid_pct": float(100.0 * valid.mean()),
+                "fallback_pct": fallback_pct,
+                "leading_fill": n_leading_filled,
                 "affine_ok": n_affine_ok,
                 "affine_fail": n_affine_fail,
             }
             if polar is not None:
-                # Surowy sygnał metody — detrend/bandpass per okno wewnątrz validate.
                 vp = validate.validate_against_hr_series(
                     sig_p, fs, polar.t_s, polar.hr_bpm, valid=valid
                 )
@@ -418,12 +524,13 @@ def run_one(
                 line += f" {row['mae_plain']:>8.2f} {row['mae_gated']:>8.2f}"
             print(line)
 
-    out_dir = _out_dir(subject, scenario, manual=use_manual)
+    out_dir = _out_dir(
+        subject, scenario, manual=use_manual, affine_mode=affine_mode, mask_mode=mask_mode
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     mode_note = (
-        f"Affine: **ręczna stała** z `{manual_gt.name}`."
-        if use_manual
-        else "Affine: **auto** (kontury + eye_y)."
+        f"Affine: **{affine_mode}**; maska: **{mask_mode}**; "
+        f"fallback gated={fallback_pct:.1f}%; leading fill={n_leading_filled}."
     )
     md = [
         f"# RGB vs RGB+termika — {subject}/{scenario}",
@@ -462,9 +569,9 @@ def run_one(
     ax.set_xlim(BAND_LOW_HZ * 60, BAND_HIGH_HZ * 60)
     ax.set_xlabel("częstość [BPM]")
     ax.set_ylabel("gęstość mocy [j.u.]")
-    mode_lbl = "manual affine" if use_manual else "auto affine"
     ax.set_title(
-        f"Widmo CHROM forehead — plain vs gated ({subject}/{scenario}, {mode_lbl})"
+        f"Widmo CHROM forehead — plain vs gated "
+        f"({subject}/{scenario}, {affine_mode}/{mask_mode})"
     )
     ax.legend(loc="upper right")
     fig.savefig(out_dir / "spectrum_forehead_chrom.png", dpi=120, bbox_inches="tight")
@@ -496,6 +603,10 @@ def _write_summary(all_rows: list[dict]) -> Path:
         "n_windows",
         "ref_src",
         "valid_pct",
+        "fallback_pct",
+        "leading_fill",
+        "affine_mode",
+        "mask_mode",
         "affine_ok",
         "affine_fail",
     ]
@@ -594,7 +705,14 @@ def main() -> None:
         failures: list[str] = []
         for rec in recordings:
             try:
-                all_rows.extend(run_one(rec.subject, rec.scenario))
+                all_rows.extend(
+                    run_one(
+                        rec.subject,
+                        rec.scenario,
+                        affine_mode=args.affine_mode,
+                        mask_mode=args.mask_mode,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 — kontynuuj pozostałe nagrania
                 msg = f"{rec.subject}/{rec.scenario}: {exc}"
                 print(f"[FAIL] {msg}")
@@ -613,7 +731,13 @@ def main() -> None:
         gt_path = _resolve_manual_gt(args.subject, args.scenario, args.manual_gt)
         print(f"Tryb ręcznej affine: {gt_path}")
 
-    run_one(args.subject, args.scenario, manual_gt=gt_path)
+    run_one(
+        args.subject,
+        args.scenario,
+        manual_gt=gt_path,
+        affine_mode=args.affine_mode,
+        mask_mode=args.mask_mode,
+    )
 
 
 if __name__ == "__main__":
