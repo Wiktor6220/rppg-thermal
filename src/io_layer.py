@@ -347,8 +347,9 @@ def load_polar_hr(
 ) -> PolarHrSeries | None:
     """Wczytuje HR z Polara H10: kolumna BPM, pomija pierwsze ``skip_samples`` po nagłówku.
 
-    Czas ``t_s`` liczony jest od pierwszej zachowanej próbki (założenie: START badania
-    ≈ początek wideo). Zwraca None, gdy brak pliku (np. subject01/s5).
+    Czas ``t_s`` jest względem **pierwszego wiersza danych** (start wideo), nie względem
+    pierwszej zachowanej próbki po skipie — dzięki temu t ≈ skip_samples sekund, a nie 0.
+    Zwraca None, gdy brak pliku (np. subject01/s5).
     """
     path = find_polar_hr_path(subject, scenario, data_dir)
     if path is None:
@@ -359,13 +360,12 @@ def load_polar_hr(
 
     with path.open(newline="") as f:
         rows = list(csv.reader(f))
-    if len(rows) <= 1 + skip_samples:
+    if len(rows) <= 1:
         return None
 
-    data = rows[1 + skip_samples :]
     times: list[datetime] = []
     hrs: list[float] = []
-    for row in data:
+    for row in rows[1:]:
         if len(row) <= hr_column:
             continue
         try:
@@ -373,12 +373,15 @@ def load_polar_hr(
             hrs.append(float(row[hr_column]))
         except (ValueError, IndexError):
             continue
-    if not hrs:
+    if len(hrs) <= skip_samples:
         return None
 
     t0 = times[0]
     t_s = np.array([(t - t0).total_seconds() for t in times], dtype=np.float64)
-    return PolarHrSeries(t_s=t_s, hr_bpm=np.asarray(hrs, dtype=np.float64))
+    return PolarHrSeries(
+        t_s=t_s[skip_samples:].astype(np.float64),
+        hr_bpm=np.asarray(hrs[skip_samples:], dtype=np.float64),
+    )
 
 
 def find_polar_ecg_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:

@@ -5,7 +5,13 @@ from collections.abc import Callable
 import numpy as np
 
 from src.config import MIN_VALID_RATIO, VALIDATION_STEP_SEC, VALIDATION_WINDOW_SEC
-from src.estimate import bandpass_filter, detrend_signal, estimate_hr_peaks, estimate_hr_welch
+from src.estimate import (
+    bandpass_filter,
+    detrend_signal,
+    estimate_hr_peaks,
+    estimate_hr_welch,
+    snr_rppg,
+)
 
 
 def _window_bounds(
@@ -215,8 +221,9 @@ def validate_against_hr_series(
 ) -> dict:
     """Waliduje rPPG względem serii HR (EKG/Polar) w oknach 10 s.
 
-    W każdym oknie: HR z Welcha (ciągłość między oknami) oraz mediana referencji
-    w ``[t0, t0+window_s)``. Okna bez referencji / z niskim ``valid[]`` → NaN.
+    W każdym oknie: HR z Welcha oraz mediana referencji w ``[t0, t0+window_s)``.
+    SNR liczone **względem referencyjnego HR** na oczyszczonym oknie (nie względem
+    estymaty). Okna bez referencji / z niskim ``valid[]`` → NaN.
     """
     estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
     ref_t_s = np.asarray(ref_t_s, dtype=np.float64)
@@ -234,9 +241,9 @@ def validate_against_hr_series(
     window_start_s = np.array([start / fs for start, _ in bounds])
     estimated_hr_bpm = np.full(n_windows, np.nan)
     reference_hr_bpm = np.full(n_windows, np.nan)
+    snr_db = np.full(n_windows, np.nan)
     window_used = np.zeros(n_windows, dtype=bool)
 
-    prev_hr: float | None = None
     for i, (start, end) in enumerate(bounds):
         if _window_valid_ratio(valid, start, end) < min_valid_ratio:
             continue
@@ -245,23 +252,31 @@ def validate_against_hr_series(
         in_win = (ref_t_s >= t0) & (ref_t_s < t1)
         if not np.any(in_win):
             continue
-        est_hr = _estimate_window_hr(
-            estimated_signal[start:end], fs, hr_estimator, prev_hr_bpm=prev_hr
-        )
         ref_hr = float(np.median(ref_hr_bpm[in_win]))
+        window_sig = estimated_signal[start:end]
+        est_hr = _estimate_window_hr(window_sig, fs, hr_estimator)
+        try:
+            cleaned = bandpass_filter(detrend_signal(window_sig), fs)
+            snr_val = float(snr_rppg(cleaned, fs, ref_hr))
+        except (ValueError, np.linalg.LinAlgError):
+            snr_val = float("nan")
+
         estimated_hr_bpm[i] = est_hr
         reference_hr_bpm[i] = ref_hr
+        snr_db[i] = snr_val
         window_used[i] = not np.isnan(est_hr)
-        if window_used[i]:
-            prev_hr = est_hr
 
     error_bpm = np.abs(estimated_hr_bpm - reference_hr_bpm)
     metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
+    snr_used = snr_db[window_used & np.isfinite(snr_db)]
+    snr_mean = float(np.mean(snr_used)) if snr_used.size else float("nan")
     return {
         "window_start_s": window_start_s,
         "estimated_hr_bpm": estimated_hr_bpm,
         "reference_hr_bpm": reference_hr_bpm,
         "error_bpm": error_bpm,
+        "snr_db": snr_db,
+        "snr_mean": snr_mean,
         "window_used": window_used,
         "n_windows_total": n_windows,
         "n_windows_used": metrics["n_windows_used"],

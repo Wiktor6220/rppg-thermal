@@ -359,8 +359,9 @@ def run_one(
             clean_g = estimate.bandpass_filter(estimate.detrend_signal(sig_g), fs)
             hr_p = estimate.estimate_hr_welch(clean_p, fs)
             hr_g = estimate.estimate_hr_welch(clean_g, fs)
-            snr_p = estimate.snr_rppg(clean_p, fs, hr_p)
-            snr_g = estimate.snr_rppg(clean_g, fs, hr_p)
+            # ΔSNR tylko vs referencja (okna); bez ref → NaN (nie vs estymaty plain).
+            snr_p = float("nan")
+            snr_g = float("nan")
             row = {
                 "subject": subject,
                 "scenario": scenario,
@@ -370,14 +371,15 @@ def run_one(
                 "hr_plain": float(hr_p),
                 "hr_gated": float(hr_g),
                 "d_hr": float(hr_g - hr_p),
-                "snr_plain": float(snr_p),
-                "snr_gated": float(snr_g),
-                "d_snr": float(snr_g - snr_p),
+                "snr_plain": snr_p,
+                "snr_gated": snr_g,
+                "d_snr": float("nan"),
                 "mae_plain": float("nan"),
                 "mae_gated": float("nan"),
                 "rmse_plain": float("nan"),
                 "rmse_gated": float("nan"),
                 "n_windows": 0,
+                "ref_src": ref_src if polar is not None else "none",
                 "valid_pct": float(100.0 * valid.mean()),
                 "affine_ok": n_affine_ok,
                 "affine_fail": n_affine_fail,
@@ -395,13 +397,22 @@ def run_one(
                 row["rmse_plain"] = float(vp["rmse_bpm"])
                 row["rmse_gated"] = float(vg["rmse_bpm"])
                 row["n_windows"] = int(vp["n_windows_used"])
+                row["snr_plain"] = float(vp["snr_mean"])
+                row["snr_gated"] = float(vg["snr_mean"])
+                row["d_snr"] = float(vg["snr_mean"] - vp["snr_mean"])
+                snr_p = row["snr_plain"]
+                snr_g = row["snr_gated"]
             rows.append(row)
             cleaned_store[(region, name, "plain")] = clean_p
             cleaned_store[(region, name, "gated")] = clean_g
+            snr_p_s = f"{snr_p:>10.2f}" if np.isfinite(snr_p) else f"{'—':>10}"
+            snr_g_s = f"{snr_g:>10.2f}" if np.isfinite(snr_g) else f"{'—':>10}"
+            d_snr = row["d_snr"]
+            d_snr_s = f"{d_snr:>+8.2f}" if np.isfinite(d_snr) else f"{'—':>8}"
             line = (
                 f"{region:<12} {name:<6} "
                 f"{hr_p:>10.2f} {hr_g:>10.2f} {hr_g - hr_p:>+8.2f} "
-                f"{snr_p:>10.2f} {snr_g:>10.2f} {snr_g - snr_p:>+8.2f}"
+                f"{snr_p_s} {snr_g_s} {d_snr_s}"
             )
             if polar is not None:
                 line += f" {row['mae_plain']:>8.2f} {row['mae_gated']:>8.2f}"
@@ -418,11 +429,11 @@ def run_one(
         f"# RGB vs RGB+termika — {subject}/{scenario}",
         "",
         mode_note,
-        "SNR względem HR z wariantu **plain**. "
+        "SNR w oknach 10 s **względem referencji** (EKG/HR), nie względem estymaty. "
         + (
-            "MAE: okna 10 s vs referencja (EKG preferowane)."
+            "MAE: okna 10 s vs ta sama referencja."
             if polar is not None
-            else "Brak referencji HR/EKG."
+            else "Brak referencji HR/EKG — ΔSNR = NaN."
         ),
         "",
         "| region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
@@ -431,10 +442,13 @@ def run_one(
     for row in rows:
         mae_p = f"{row['mae_plain']:.2f}" if not np.isnan(row["mae_plain"]) else "—"
         mae_g = f"{row['mae_gated']:.2f}" if not np.isnan(row["mae_gated"]) else "—"
+        snr_p = f"{row['snr_plain']:.2f}" if np.isfinite(row["snr_plain"]) else "—"
+        snr_g = f"{row['snr_gated']:.2f}" if np.isfinite(row["snr_gated"]) else "—"
+        d_snr = f"{row['d_snr']:+.2f}" if np.isfinite(row["d_snr"]) else "—"
         md.append(
             f"| {row['region']} | {row['method']} | {row['hr_plain']:.2f} | "
             f"{row['hr_gated']:.2f} | {row['d_hr']:+.2f} | "
-            f"{row['snr_plain']:.2f} | {row['snr_gated']:.2f} | {row['d_snr']:+.2f} | "
+            f"{snr_p} | {snr_g} | {d_snr} | "
             f"{mae_p} | {mae_g} |"
         )
     md.append("")
@@ -480,6 +494,7 @@ def _write_summary(all_rows: list[dict]) -> Path:
         "rmse_plain",
         "rmse_gated",
         "n_windows",
+        "ref_src",
         "valid_pct",
         "affine_ok",
         "affine_fail",
@@ -494,7 +509,8 @@ def _write_summary(all_rows: list[dict]) -> Path:
     lines = [
         "# Zbiorcze porównanie RGB vs RGB+termika (wszystkie nagrania)",
         "",
-        "ΔSNR > 0 ⇒ termika poprawia czystość. MAE: okna 10 s vs referencja EKG/HR (mniejsze = lepiej). ΔMAE = gated − plain.",
+        "ΔSNR = średnia SNR okienna gated − plain, **względem referencji HR** (nie względem estymaty). "
+        "MAE: okna 10 s vs ta sama referencja. ΔMAE = gated − plain.",
         "",
         "| subject | scenario | region | metoda | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | ΔMAE |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
@@ -502,19 +518,21 @@ def _write_summary(all_rows: list[dict]) -> Path:
     for row in all_rows:
         mae_p = row.get("mae_plain", float("nan"))
         mae_g = row.get("mae_gated", float("nan"))
+        d_snr = row.get("d_snr", float("nan"))
         if np.isnan(mae_p) or np.isnan(mae_g):
             mae_p_s, mae_g_s, d_mae_s = "—", "—", "—"
         else:
             mae_p_s = f"{mae_p:.2f}"
             mae_g_s = f"{mae_g:.2f}"
             d_mae_s = f"{mae_g - mae_p:+.2f}"
+        d_snr_s = f"{d_snr:+.2f}" if np.isfinite(d_snr) else "—"
         lines.append(
             f"| {row['subject']} | {row['scenario']} | {row['region']} | {row['method']} | "
-            f"{row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {row['d_snr']:+.2f} | "
+            f"{row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {d_snr_s} | "
             f"{mae_p_s} | {mae_g_s} | {d_mae_s} |"
         )
 
-    lines.extend(["", "## Średnie ΔSNR [dB] (gated − plain)", ""])
+    lines.extend(["", "## Średnie ΔSNR [dB] (gated − plain, tylko nagrania z referencją)", ""])
     lines.append("| region | metoda | średnie ΔSNR | n |")
     lines.append("|---|---|---:|---:|")
     for region in REGIONS_REPORT:
@@ -522,7 +540,9 @@ def _write_summary(all_rows: list[dict]) -> Path:
             vals = [
                 r["d_snr"]
                 for r in all_rows
-                if r["region"] == region and r["method"] == method
+                if r["region"] == region
+                and r["method"] == method
+                and np.isfinite(r.get("d_snr", float("nan")))
             ]
             if vals:
                 lines.append(

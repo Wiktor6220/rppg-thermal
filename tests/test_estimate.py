@@ -17,6 +17,19 @@ TRUE_HR_BPM = 72.0
 TOLERANCE_BPM = 5.0
 
 
+def _pink_noise(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Przybliżony szum 1/f w dziedzinie częstotliwości."""
+    freqs = np.fft.rfftfreq(n)
+    phases = rng.standard_normal(freqs.shape) + 1j * rng.standard_normal(freqs.shape)
+    phases[0] = 0.0
+    mag = np.ones_like(freqs)
+    mag[1:] = 1.0 / np.sqrt(freqs[1:])
+    spectrum = phases * mag
+    out = np.fft.irfft(spectrum, n=n).real
+    std = out.std()
+    return out / std if std > 0 else out
+
+
 @pytest.fixture
 def cleaned_pulse():
     """Syntetyczny puls 1D po detrendzie i filtracji pasmowej."""
@@ -68,24 +81,22 @@ def test_snr_low_for_broadband_noise():
     assert snr_rppg(noise, FS_TEST, TRUE_HR_BPM) < 3.0
 
 
-def test_welch_prefers_fundamental_over_harmonic():
-    """Gdy w widmie dominuje 2×, estymator wybiera fundament."""
-    n = int(FS_TEST * 60)
-    t = np.arange(n) / FS_TEST
-    f0 = TRUE_HR_BPM / 60.0
-    # Silniejsza 2. harmoniczna + słabsza podstawowa
-    sig = 0.4 * np.sin(2 * np.pi * f0 * t) + 1.0 * np.sin(2 * np.pi * 2 * f0 * t)
-    cleaned = bandpass_filter(detrend_signal(sig), FS_TEST)
-    hr = estimate_hr_welch(cleaned, FS_TEST)
-    assert abs(hr - TRUE_HR_BPM) <= 8.0
-
-
-def test_welch_continuity_limits_jump():
-    """Przy prev_hr estymator nie skacze o oktawę bez powodu."""
-    n = int(FS_TEST * 20)
-    t = np.arange(n) / FS_TEST
-    f0 = TRUE_HR_BPM / 60.0
-    sig = np.sin(2 * np.pi * 2 * f0 * t)  # tylko 2×
-    cleaned = bandpass_filter(detrend_signal(sig), FS_TEST)
-    hr = estimate_hr_welch(cleaned, FS_TEST, prev_hr_bpm=TRUE_HR_BPM, max_jump_bpm=25.0)
-    assert abs(hr - TRUE_HR_BPM) <= 10.0
+@pytest.mark.parametrize("true_hr", [90.0, 110.0, 130.0])
+def test_welch_argmax_recovers_high_hr_under_pink_noise(true_hr):
+    """Czysty argmax Welcha nie połowi HR ≥ 84 BPM przy szumie różowym."""
+    fs = 29.97
+    duration_s = 10.0
+    n = int(round(duration_s * fs))
+    t = np.arange(n) / fs
+    rng = np.random.default_rng(42)
+    n_trials = 40
+    ok = 0
+    for i in range(n_trials):
+        pulse = np.sin(2 * np.pi * (true_hr / 60.0) * t)
+        noise = _pink_noise(n, np.random.default_rng(rng.integers(0, 2**31 - 1)))
+        sig = pulse + 0.8 * noise
+        cleaned = bandpass_filter(detrend_signal(sig), fs)
+        hr = estimate_hr_welch(cleaned, fs)
+        if abs(hr - true_hr) <= 3.0:
+            ok += 1
+    assert ok / n_trials >= 0.90

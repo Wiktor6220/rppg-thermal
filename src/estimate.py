@@ -9,7 +9,6 @@ from src.config import (
     BAND_LOW_HZ,
     BUTTERWORTH_ORDER,
     DETREND_LAMBDA,
-    HR_MAX_JUMP_BPM,
     WELCH_SEGMENT_SEC,
 )
 
@@ -44,68 +43,25 @@ def bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
     return sosfiltfilt(sos, signal)
 
 
-def _welch_band_spectrum(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
-    """Zwraca (freqs_hz, psd) ograniczone do pasma HR."""
-    signal = np.asarray(signal, dtype=np.float64)
-    nperseg = min(len(signal), int(round(WELCH_SEGMENT_SEC * fs)))
-    freqs, psd = welch(signal, fs=fs, nperseg=nperseg)
-    band = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
-    if not np.any(band):
-        raise ValueError("Brak składowych widma w paśmie fizjologicznym HR.")
-    return freqs[band], psd[band]
-
-
-def _prefer_fundamental_hz(freqs: np.ndarray, psd: np.ndarray) -> float:
-    """Wybiera częstość z ochroną przed 2× harmoniczną."""
-    i_max = int(np.argmax(psd))
-    f_max = float(freqs[i_max])
-
-    peak_idx, _ = find_peaks(psd)
-    if peak_idx.size == 0:
-        peak_idx = np.array([i_max])
-
-    # Jeśli argmax ≈ 2·f0 dla któregoś lokalnego maksimum → fundament.
-    for idx in peak_idx:
-        f0 = float(freqs[idx])
-        if f0 <= 0:
-            continue
-        if abs(f_max - 2.0 * f0) <= max(0.12, 0.08 * f_max):
-            return f0
-
-    f_half = f_max / 2.0
-    if f_half >= BAND_LOW_HZ:
-        # bin Welcha najbliższy f_half — nawet bez find_peaks
-        j = int(np.argmin(np.abs(freqs - f_half)))
-        if abs(freqs[j] - f_half) <= 0.15 and psd[j] >= 0.12 * psd[i_max]:
-            return float(freqs[j])
-    return f_max
-
-
 def estimate_hr_welch(
     signal: np.ndarray,
     fs: float,
     prev_hr_bpm: float | None = None,
-    max_jump_bpm: float = HR_MAX_JUMP_BPM,
+    max_jump_bpm: float | None = None,
 ) -> float:
-    """HR z Welcha: ochrona przed 2× oraz korekta harmoniczna względem poprzedniego okna."""
-    freqs, psd = _welch_band_spectrum(signal, fs)
-    hr = _prefer_fundamental_hz(freqs, psd) * 60.0
+    """HR = argmax widma Welcha w paśmie HR; zero-padding dla rozdzielczości < 1 BPM.
 
-    if prev_hr_bpm is None or not np.isfinite(prev_hr_bpm):
-        return float(hr)
-
-    # Tylko warianty harmoniczne bieżącego wyboru — bez blokowania realnej zmiany HR.
-    candidates = [hr]
-    if BAND_LOW_HZ * 60 <= hr / 2 <= BAND_HIGH_HZ * 60:
-        candidates.append(hr / 2)
-    if BAND_LOW_HZ * 60 <= hr * 2 <= BAND_HIGH_HZ * 60:
-        candidates.append(hr * 2)
-    candidates = np.asarray(candidates, dtype=np.float64)
-    dist = np.abs(candidates - prev_hr_bpm)
-    j = int(np.argmin(dist))
-    if dist[j] <= max_jump_bpm:
-        return float(candidates[j])
-    return float(hr)
+    ``prev_hr_bpm`` / ``max_jump_bpm`` zachowane dla zgodności interfejsu — ignorowane
+    (heurystyki harmoniczne / ciągłość połowiły prawidłowe HR przy szumie 1/f).
+    """
+    del prev_hr_bpm, max_jump_bpm  # API compat; nie używane
+    signal = np.asarray(signal, dtype=np.float64)
+    nperseg = min(len(signal), int(round(WELCH_SEGMENT_SEC * fs)))
+    freqs, psd = welch(signal, fs=fs, nperseg=nperseg, nfft=max(nperseg, 2048))
+    band = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
+    if not np.any(band):
+        raise ValueError("Brak składowych widma w paśmie fizjologicznym HR.")
+    return float(freqs[band][np.argmax(psd[band])] * 60.0)
 
 
 def estimate_hr_peaks(signal: np.ndarray, fs: float) -> float:

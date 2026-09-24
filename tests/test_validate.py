@@ -86,3 +86,31 @@ def test_compute_mae_all_nan_returns_nan():
     est = np.array([np.nan, np.nan])
     ref = np.array([np.nan, np.nan])
     assert np.isnan(compute_mae(est, ref))
+
+
+def test_delta_snr_near_zero_for_equal_quality_signals():
+    """Dwa sygnały o równej jakości → średnie ΔSNR bliskie 0 (brak obciążenia metryki)."""
+    from src.validate import validate_against_hr_series
+
+    fs = 30.0
+    duration_s = 40.0
+    true_hr = 90.0
+    n = int(duration_s * fs)
+    t = np.arange(n) / fs
+    ref_t = np.arange(0.0, duration_s, 1.0)
+    ref_hr = np.full(ref_t.shape, true_hr)
+    rng = np.random.default_rng(7)
+    deltas = []
+    for _ in range(200):
+        noise_a = rng.standard_normal(n)
+        noise_b = rng.standard_normal(n)
+        pulse = np.sin(2 * np.pi * (true_hr / 60.0) * t)
+        # Identyczna jakość: ten sam SNR (amplituda pulsu / skala szumu).
+        sig_a = pulse + 0.5 * noise_a
+        sig_b = pulse + 0.5 * noise_b
+        va = validate_against_hr_series(sig_a, fs, ref_t, ref_hr)
+        vb = validate_against_hr_series(sig_b, fs, ref_t, ref_hr)
+        if np.isfinite(va["snr_mean"]) and np.isfinite(vb["snr_mean"]):
+            deltas.append(vb["snr_mean"] - va["snr_mean"])
+    assert len(deltas) >= 150
+    assert abs(float(np.mean(deltas))) < 0.15

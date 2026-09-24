@@ -60,3 +60,29 @@ def test_reference_rejects_bad_ecg_vs_hr_csv():
     assert src == "hr_csv"
     med = float(np.median(series.hr_bpm))
     assert 50.0 <= med <= 85.0
+    # t_s względem startu wideo (po skip 5 próbek ~1 Hz → ≈5 s)
+    assert float(series.t_s.min()) >= 4.0
+
+
+def test_load_polar_hr_time_axis_starts_after_skip(tmp_path, monkeypatch):
+    """t0 = pierwszy wiersz danych; po skip=5 pierwsza próbka ma t_s == 5.0."""
+    from src.io_layer import load_polar_hr
+
+    session = tmp_path / "subject99" / "s1_rest_rest"
+    session.mkdir(parents=True)
+    hr_path = session / "subject99_s1_HR.csv"
+    lines = ["Phone timestamp,sensor timestamp [ns],HR [bpm],extra"]
+    for i in range(10):
+        # kolumna 3 (0-based) = BPM — w pliku Polar: idx 2 często; config POLAR_HR_COLUMN=3
+        # Format: time, a, b, HR, ...
+        lines.append(f"12:00:{i:02d}.000000,0,0,{60 + i},x")
+    hr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "src.io_layer.find_polar_hr_path",
+        lambda subject, scenario, data_dir=None: hr_path,
+    )
+    series = load_polar_hr("subject99", "s1_rest_rest", data_dir=tmp_path, skip_samples=5)
+    assert series is not None
+    assert series.t_s[0] == 5.0
+    assert len(series.hr_bpm) == 5
