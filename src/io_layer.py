@@ -9,7 +9,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from src.config import DATA_DIR, POLAR_HR_COLUMN, POLAR_HR_SKIP_SAMPLES
+from src.config import (
+    DATA_DIR,
+    ECG_FRAME_MARKERS,
+    ECG_FS_HZ,
+    ECG_HR_MAX_BPM,
+    ECG_HR_MIN_BPM,
+    ECG_SKIP_SEC,
+    POLAR_HR_COLUMN,
+    POLAR_HR_SKIP_SAMPLES,
+)
 
 # Konwencja nazw strumieni w folderze sesji (porównania case-insensitive).
 _RGB_SUFFIX = "rgb"
@@ -370,6 +379,119 @@ def load_polar_hr(
     t0 = times[0]
     t_s = np.array([(t - t0).total_seconds() for t in times], dtype=np.float64)
     return PolarHrSeries(t_s=t_s, hr_bpm=np.asarray(hrs, dtype=np.float64))
+
+
+def find_polar_ecg_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:
+    """Ścieżka do ``*_ECG.csv`` w folderze sesji albo None."""
+    rec = find_recording(subject, scenario, data_dir)
+    session_dir = rec.rgb_path.parent
+    matches = sorted(session_dir.glob("*_ECG.csv")) + sorted(session_dir.glob("*ECG.csv"))
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if unique else None
+
+
+def parse_polar_ecg_samples(
+    path: Path,
+    markers: tuple[tuple[int, int, int, int], ...] = ECG_FRAME_MARKERS,
+) -> np.ndarray:
+    """Dekoduje surowe próbki EKG z CSV Polara (markery CR/DR + 3-bajtowe LE signed)."""
+    import csv
+
+    with path.open(newline="") as f:
+        rows = list(csv.reader(f))
+    if len(rows) <= 1:
+        return np.array([], dtype=np.float64)
+
+    marker_lists = [list(m) for m in markers]
+    samples: list[int] = []
+    for row in rows[1:]:
+        try:
+            vals = [int(x) for x in row]
+        except ValueError:
+            continue
+        start = None
+        for i in range(len(vals) - 3):
+            chunk = vals[i : i + 4]
+            if any(chunk == m for m in marker_lists):
+                start = i + 4
+                break
+        if start is None:
+            continue
+        payload = vals[start:]
+        for j in range(0, len(payload) - 2, 3):
+            b0, b1, b2 = payload[j : j + 3]
+            v = b0 | (b1 << 8) | (b2 << 16)
+            if v & 0x800000:
+                v -= 0x1000000
+            samples.append(v)
+    return np.asarray(samples, dtype=np.float64)
+
+
+def load_polar_ecg_hr(
+    subject: str,
+    scenario: str,
+    data_dir: Path = DATA_DIR,
+    fs_hz: float = ECG_FS_HZ,
+    skip_sec: float = ECG_SKIP_SEC,
+    hr_min: float = ECG_HR_MIN_BPM,
+    hr_max: float = ECG_HR_MAX_BPM,
+) -> PolarHrSeries | None:
+    """HR z EKG Polara (neurokit2): odcięcie ``skip_sec``, seria (t_s, hr) od R-R.
+
+    Czas ``t_s`` jest względem początku pliku EKG (= założony start wideo).
+    Pierwsze ``skip_sec`` sekund sygnału są pomijane przed detekcją załamków R.
+    """
+    path = find_polar_ecg_path(subject, scenario, data_dir)
+    if path is None:
+        return None
+
+    import neurokit2 as nk
+
+    raw = parse_polar_ecg_samples(path)
+    if raw.size < int(fs_hz * (skip_sec + 5)):
+        return None
+
+    skip = int(round(skip_sec * fs_hz))
+    seg = raw[skip:]
+    clean = nk.ecg_clean(seg, sampling_rate=fs_hz)
+    _, info = nk.ecg_peaks(clean, sampling_rate=fs_hz, method="pantompkins1985")
+    peaks = np.asarray(info["ECG_R_Peaks"], dtype=np.int64)
+    if peaks.size < 3:
+        return None
+
+    rr_s = np.diff(peaks) / fs_hz
+    hr = 60.0 / rr_s
+    t_mid = (peaks[:-1] + peaks[1:]) / (2.0 * fs_hz) + skip_sec
+    ok = (hr >= hr_min) & (hr <= hr_max) & np.isfinite(hr)
+    if not np.any(ok):
+        return None
+    return PolarHrSeries(t_s=t_mid[ok].astype(np.float64), hr_bpm=hr[ok].astype(np.float64))
+
+
+def load_reference_hr(
+    subject: str,
+    scenario: str,
+    data_dir: Path = DATA_DIR,
+    max_median_diff_bpm: float = 20.0,
+) -> tuple[PolarHrSeries | None, str]:
+    """Preferuje EKG (neurokit2); fallback do pliku HR.
+
+    Jeśli EKG i plik HR się mocno rozjeżdżają (|Δ mediana| > ``max_median_diff_bpm``),
+    uznajemy detekcję R za zawodną i wracamy do pliku HR (po skip).
+    """
+    ecg = load_polar_ecg_hr(subject, scenario, data_dir)
+    hr = load_polar_hr(subject, scenario, data_dir)
+
+    if ecg is not None and ecg.hr_bpm.size >= 3:
+        if hr is not None and hr.hr_bpm.size >= 3:
+            ecg_med = float(np.median(ecg.hr_bpm))
+            hr_med = float(np.median(hr.hr_bpm))
+            if abs(ecg_med - hr_med) > max_median_diff_bpm:
+                return hr, "hr_csv"
+        return ecg, "ecg"
+    if hr is not None:
+        return hr, "hr_csv"
+    return None, "none"
 
 
 # Placeholdery: UBFC / iBVP (później)

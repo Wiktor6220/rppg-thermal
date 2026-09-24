@@ -68,9 +68,24 @@ def test_snr_low_for_broadband_noise():
     assert snr_rppg(noise, FS_TEST, TRUE_HR_BPM) < 3.0
 
 
-def test_snr_drops_when_signal_at_wrong_reference():
-    """SNR liczone względem błędnej częstości jest niższe niż względem prawdziwej."""
-    n = int(FS_TEST * 30)
+def test_welch_prefers_fundamental_over_harmonic():
+    """Gdy w widmie dominuje 2×, estymator wybiera fundament."""
+    n = int(FS_TEST * 60)
     t = np.arange(n) / FS_TEST
-    sine = np.sin(2 * np.pi * (TRUE_HR_BPM / 60.0) * t)
-    assert snr_rppg(sine, FS_TEST, TRUE_HR_BPM) > snr_rppg(sine, FS_TEST, TRUE_HR_BPM + 30.0)
+    f0 = TRUE_HR_BPM / 60.0
+    # Silniejsza 2. harmoniczna + słabsza podstawowa
+    sig = 0.4 * np.sin(2 * np.pi * f0 * t) + 1.0 * np.sin(2 * np.pi * 2 * f0 * t)
+    cleaned = bandpass_filter(detrend_signal(sig), FS_TEST)
+    hr = estimate_hr_welch(cleaned, FS_TEST)
+    assert abs(hr - TRUE_HR_BPM) <= 8.0
+
+
+def test_welch_continuity_limits_jump():
+    """Przy prev_hr estymator nie skacze o oktawę bez powodu."""
+    n = int(FS_TEST * 20)
+    t = np.arange(n) / FS_TEST
+    f0 = TRUE_HR_BPM / 60.0
+    sig = np.sin(2 * np.pi * 2 * f0 * t)  # tylko 2×
+    cleaned = bandpass_filter(detrend_signal(sig), FS_TEST)
+    hr = estimate_hr_welch(cleaned, FS_TEST, prev_hr_bpm=TRUE_HR_BPM, max_jump_bpm=25.0)
+    assert abs(hr - TRUE_HR_BPM) <= 10.0

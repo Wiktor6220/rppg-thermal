@@ -35,10 +35,23 @@ PERFUSION_TEMP_STD_FACTOR: float = 0.5
 # Zbyt mała maska perfuzji → fallback do pełnego ROI
 PERFUSION_MIN_ROI_FRAC: float = 0.10
 
-# --- Referencja Polar H10 (plik *_HR.csv) ---
-# Kolumna 4 (1-based; nagłówek „2026”) = HR [BPM]. Pierwsze N próbek = kalibracja.
-POLAR_HR_COLUMN: int = 3  # 0-based index
+# --- Referencja Polar H10 ---
+# Plik HR: kolumna 4 (1-based) = BPM; pierwsze N próbek = kalibracja (backup).
+POLAR_HR_COLUMN: int = 3  # 0-based
 POLAR_HR_SKIP_SAMPLES: int = 5
+# EKG (preferowane): ramki z markerem, próbki 3-bajtowe LE signed @ 130 Hz.
+ECG_FS_HZ: float = 130.0
+ECG_SKIP_SEC: float = 10.0
+# Polar eksportuje ramki z pierwszym bajtem 67 („CR”) albo 68 („DR”).
+ECG_FRAME_MARKERS: tuple[tuple[int, int, int, int], ...] = (
+    (67, 82, 8, 0),
+    (68, 82, 8, 0),
+)
+ECG_HR_MIN_BPM: float = 45.0
+ECG_HR_MAX_BPM: float = 140.0  # wycina typowe 2× false peaks z detekcji R
+
+# Estymator Welch: max skok HR między oknami (ciągłość) [BPM]
+HR_MAX_JUMP_BPM: float = 25.0
 
 # --- Odświeżanie affine termika→RGB (klatki) wg scenariusza ---
 AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {

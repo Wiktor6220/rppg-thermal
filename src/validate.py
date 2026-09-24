@@ -115,12 +115,18 @@ def _window_valid_ratio(valid: np.ndarray, start: int, end: int) -> float:
 
 
 def _estimate_window_hr(
-    window_signal: np.ndarray, fs: float, hr_estimator: Callable[[np.ndarray, float], float]
+    window_signal: np.ndarray,
+    fs: float,
+    hr_estimator: Callable[..., float],
+    prev_hr_bpm: float | None = None,
 ) -> float:
-    """Detrend + filtracja pasmowa + estymacja HR na pojedynczym oknie; NaN przy błędzie."""
+    """Detrend + bandpass + estymacja HR na oknie; NaN przy błędzie."""
     try:
         cleaned = bandpass_filter(detrend_signal(window_signal), fs)
-        return float(hr_estimator(cleaned, fs))
+        try:
+            return float(hr_estimator(cleaned, fs, prev_hr_bpm=prev_hr_bpm))
+        except TypeError:
+            return float(hr_estimator(cleaned, fs))
     except (ValueError, np.linalg.LinAlgError):
         return float("nan")
 
@@ -164,16 +170,21 @@ def validate_signal(
     reference_hr_bpm = np.full(n_windows, np.nan)
     window_used = np.zeros(n_windows, dtype=bool)
 
+    prev_est: float | None = None
     for i, (start, end) in enumerate(bounds):
         if _window_valid_ratio(valid, start, end) < min_valid_ratio:
-            continue  # za mało valid[] w oknie
+            continue
 
-        est_hr = _estimate_window_hr(estimated_signal[start:end], fs, hr_estimator)
+        est_hr = _estimate_window_hr(
+            estimated_signal[start:end], fs, hr_estimator, prev_hr_bpm=prev_est
+        )
         ref_hr = _estimate_window_hr(reference_signal[start:end], fs, reference_hr_estimator)
 
         estimated_hr_bpm[i] = est_hr
         reference_hr_bpm[i] = ref_hr
         window_used[i] = not (np.isnan(est_hr) or np.isnan(ref_hr))
+        if window_used[i]:
+            prev_est = est_hr
 
     error_bpm = np.abs(estimated_hr_bpm - reference_hr_bpm)
     metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
@@ -202,11 +213,10 @@ def validate_against_hr_series(
     min_valid_ratio: float = MIN_VALID_RATIO,
     hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
 ) -> dict:
-    """Waliduje rPPG względem rzadkiej serii HR (np. Polar ~1 Hz) w oknach 10 s.
+    """Waliduje rPPG względem serii HR (EKG/Polar) w oknach 10 s.
 
-    W każdym oknie: HR z Welcha na sygnale rPPG oraz średnia próbek Polar, których
-    czas wypada w ``[t0, t0+window_s)``. Okna bez próbek Polar albo z niskim
-    ``valid[]`` są pomijane (NaN).
+    W każdym oknie: HR z Welcha (ciągłość między oknami) oraz mediana referencji
+    w ``[t0, t0+window_s)``. Okna bez referencji / z niskim ``valid[]`` → NaN.
     """
     estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
     ref_t_s = np.asarray(ref_t_s, dtype=np.float64)
@@ -226,6 +236,7 @@ def validate_against_hr_series(
     reference_hr_bpm = np.full(n_windows, np.nan)
     window_used = np.zeros(n_windows, dtype=bool)
 
+    prev_hr: float | None = None
     for i, (start, end) in enumerate(bounds):
         if _window_valid_ratio(valid, start, end) < min_valid_ratio:
             continue
@@ -234,11 +245,15 @@ def validate_against_hr_series(
         in_win = (ref_t_s >= t0) & (ref_t_s < t1)
         if not np.any(in_win):
             continue
-        est_hr = _estimate_window_hr(estimated_signal[start:end], fs, hr_estimator)
-        ref_hr = float(np.mean(ref_hr_bpm[in_win]))
+        est_hr = _estimate_window_hr(
+            estimated_signal[start:end], fs, hr_estimator, prev_hr_bpm=prev_hr
+        )
+        ref_hr = float(np.median(ref_hr_bpm[in_win]))
         estimated_hr_bpm[i] = est_hr
         reference_hr_bpm[i] = ref_hr
         window_used[i] = not np.isnan(est_hr)
+        if window_used[i]:
+            prev_hr = est_hr
 
     error_bpm = np.abs(estimated_hr_bpm - reference_hr_bpm)
     metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)

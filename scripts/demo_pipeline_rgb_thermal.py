@@ -40,7 +40,7 @@ from src.config import (  # noqa: E402
     PERFUSION_TEMP_STD_FACTOR,
     RESULTS_DIR,
 )
-from src.io_layer import list_recordings, load_polar_hr, load_recording  # noqa: E402
+from src.io_layer import list_recordings, load_recording, load_reference_hr  # noqa: E402
 from src.registration import (  # noqa: E402
     apply_affine,
     estimate_affine_thermal_to_rgb,
@@ -328,13 +328,15 @@ def run_one(
         f"({int(valid.sum())}/{valid.size}); affine OK/fail: {n_affine_ok}/{n_affine_fail}"
     )
 
-    polar = load_polar_hr(subject, scenario)
+    polar, ref_src = load_reference_hr(subject, scenario)
     if polar is None:
-        print("Polar HR: brak pliku — pomijam MAE/RMSE okienne")
+        print("Referencja HR: brak EKG i pliku HR — pomijam MAE/RMSE okienne")
     else:
+        src_lbl = "EKG (neurokit2, skip 10 s)" if ref_src == "ecg" else "plik HR (skip 5)"
         print(
-            f"Polar HR: {len(polar.hr_bpm)} próbek, "
-            f"średnia {float(polar.hr_bpm.mean()):.1f} BPM (po skip kalibracji)"
+            f"Referencja: {src_lbl} — {len(polar.hr_bpm)} próbek, "
+            f"mediana {float(np.median(polar.hr_bpm)):.1f} BPM, "
+            f"średnia {float(polar.hr_bpm.mean()):.1f} BPM"
         )
 
     rows: list[dict] = []
@@ -418,9 +420,9 @@ def run_one(
         mode_note,
         "SNR względem HR z wariantu **plain**. "
         + (
-            "MAE: okna 10 s vs Polar H10."
+            "MAE: okna 10 s vs referencja (EKG preferowane)."
             if polar is not None
-            else "Brak pliku Polar HR."
+            else "Brak referencji HR/EKG."
         ),
         "",
         "| region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
@@ -492,7 +494,7 @@ def _write_summary(all_rows: list[dict]) -> Path:
     lines = [
         "# Zbiorcze porównanie RGB vs RGB+termika (wszystkie nagrania)",
         "",
-        "ΔSNR > 0 ⇒ termika poprawia czystość. MAE: okna 10 s vs Polar (mniejsze = lepiej). ΔMAE = gated − plain.",
+        "ΔSNR > 0 ⇒ termika poprawia czystość. MAE: okna 10 s vs referencja EKG/HR (mniejsze = lepiej). ΔMAE = gated − plain.",
         "",
         "| subject | scenario | region | metoda | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | ΔMAE |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
@@ -527,7 +529,7 @@ def _write_summary(all_rows: list[dict]) -> Path:
                     f"| {region} | {method} | {float(np.mean(vals)):+.2f} | {len(vals)} |"
                 )
 
-    lines.extend(["", "## Średnie MAE vs Polar [BPM] (okna 10 s)", ""])
+    lines.extend(["", "## Średnie MAE vs referencja [BPM] (okna 10 s)", ""])
     lines.append("| region | metoda | MAE plain | MAE gated | ΔMAE | n |")
     lines.append("|---|---|---:|---:|---:|---:|")
     for region in REGIONS_REPORT:

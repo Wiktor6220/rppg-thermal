@@ -1,4 +1,4 @@
-"""Przetwarzanie sygnału rPPG do estymaty HR: detrend, filtracja pasmowa, HR z Welcha/pików."""
+"""Przetwarzanie sygnału rPPG: detrend, filtracja pasmowa, estymacja HR."""
 
 import numpy as np
 from scipy import sparse
@@ -9,6 +9,7 @@ from src.config import (
     BAND_LOW_HZ,
     BUTTERWORTH_ORDER,
     DETREND_LAMBDA,
+    HR_MAX_JUMP_BPM,
     WELCH_SEGMENT_SEC,
 )
 
@@ -31,18 +32,7 @@ def detrend_signal(signal: np.ndarray, lambda_param: float = DETREND_LAMBDA) -> 
 
 
 def bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
-    """Filtruje sygnał pasmowo-przepustowo (Butterworth, filtracja zerofazowa).
-
-    Pasmo i rząd filtru brane są z `config.py` (`BAND_LOW_HZ`, `BAND_HIGH_HZ`,
-    `BUTTERWORTH_ORDER`), odpowiadające fizjologicznemu zakresowi HR.
-
-    Args:
-        signal: 1D sygnał wejściowy.
-        fs: częstotliwość próbkowania sygnału (Hz).
-
-    Returns:
-        1D sygnał po filtracji pasmowej, tej samej długości co wejście.
-    """
+    """Filtr pasmowo-przepustowy Butterworth (zerofazowy), pasmo z config."""
     signal = np.asarray(signal, dtype=np.float64)
     nyquist_hz = fs / 2.0
     sos = butter(
@@ -54,45 +44,72 @@ def bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
     return sosfiltfilt(sos, signal)
 
 
-def estimate_hr_welch(signal: np.ndarray, fs: float) -> float:
-    """Estymuje HR na podstawie widma mocy sygnału (metoda Welcha) — dominująca częstość.
-
-    Długość segmentu Welcha brana jest z `config.WELCH_SEGMENT_SEC`, a pasmo
-    poszukiwania piku widma z `config.BAND_LOW_HZ`/`config.BAND_HIGH_HZ`.
-
-    Args:
-        signal: 1D sygnał rPPG (po detrendingu i filtracji pasmowej).
-        fs: częstotliwość próbkowania sygnału (Hz).
-
-    Returns:
-        Estymowana częstość akcji serca w uderzeniach na minutę (bpm).
-    """
+def _welch_band_spectrum(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """Zwraca (freqs_hz, psd) ograniczone do pasma HR."""
     signal = np.asarray(signal, dtype=np.float64)
     nperseg = min(len(signal), int(round(WELCH_SEGMENT_SEC * fs)))
-
     freqs, psd = welch(signal, fs=fs, nperseg=nperseg)
-    band_mask = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
-    if not np.any(band_mask):
+    band = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
+    if not np.any(band):
         raise ValueError("Brak składowych widma w paśmie fizjologicznym HR.")
+    return freqs[band], psd[band]
 
-    dominant_freq_hz = freqs[band_mask][np.argmax(psd[band_mask])]
-    return dominant_freq_hz * 60.0
+
+def _prefer_fundamental_hz(freqs: np.ndarray, psd: np.ndarray) -> float:
+    """Wybiera częstość z ochroną przed 2× harmoniczną."""
+    i_max = int(np.argmax(psd))
+    f_max = float(freqs[i_max])
+
+    peak_idx, _ = find_peaks(psd)
+    if peak_idx.size == 0:
+        peak_idx = np.array([i_max])
+
+    # Jeśli argmax ≈ 2·f0 dla któregoś lokalnego maksimum → fundament.
+    for idx in peak_idx:
+        f0 = float(freqs[idx])
+        if f0 <= 0:
+            continue
+        if abs(f_max - 2.0 * f0) <= max(0.12, 0.08 * f_max):
+            return f0
+
+    f_half = f_max / 2.0
+    if f_half >= BAND_LOW_HZ:
+        # bin Welcha najbliższy f_half — nawet bez find_peaks
+        j = int(np.argmin(np.abs(freqs - f_half)))
+        if abs(freqs[j] - f_half) <= 0.15 and psd[j] >= 0.12 * psd[i_max]:
+            return float(freqs[j])
+    return f_max
+
+
+def estimate_hr_welch(
+    signal: np.ndarray,
+    fs: float,
+    prev_hr_bpm: float | None = None,
+    max_jump_bpm: float = HR_MAX_JUMP_BPM,
+) -> float:
+    """HR z Welcha: ochrona przed 2× oraz korekta harmoniczna względem poprzedniego okna."""
+    freqs, psd = _welch_band_spectrum(signal, fs)
+    hr = _prefer_fundamental_hz(freqs, psd) * 60.0
+
+    if prev_hr_bpm is None or not np.isfinite(prev_hr_bpm):
+        return float(hr)
+
+    # Tylko warianty harmoniczne bieżącego wyboru — bez blokowania realnej zmiany HR.
+    candidates = [hr]
+    if BAND_LOW_HZ * 60 <= hr / 2 <= BAND_HIGH_HZ * 60:
+        candidates.append(hr / 2)
+    if BAND_LOW_HZ * 60 <= hr * 2 <= BAND_HIGH_HZ * 60:
+        candidates.append(hr * 2)
+    candidates = np.asarray(candidates, dtype=np.float64)
+    dist = np.abs(candidates - prev_hr_bpm)
+    j = int(np.argmin(dist))
+    if dist[j] <= max_jump_bpm:
+        return float(candidates[j])
+    return float(hr)
 
 
 def estimate_hr_peaks(signal: np.ndarray, fs: float) -> float:
-    """Estymuje HR na podstawie detekcji pików w dziedzinie czasu (`find_peaks`).
-
-    Minimalny odstęp między pikami wyznaczany jest z `config.BAND_HIGH_HZ`
-    (najwyższa dopuszczalna częstość HR), aby wykluczyć niefizjologicznie
-    bliskie detekcje.
-
-    Args:
-        signal: 1D sygnał rPPG (po detrendingu i filtracji pasmowej).
-        fs: częstotliwość próbkowania sygnału (Hz).
-
-    Returns:
-        Estymowana częstość akcji serca w uderzeniach na minutę (bpm).
-    """
+    """HR z odstępów między pikami w dziedzinie czasu."""
     signal = np.asarray(signal, dtype=np.float64)
     min_distance_samples = max(1, int(round(fs / BAND_HIGH_HZ)))
 
