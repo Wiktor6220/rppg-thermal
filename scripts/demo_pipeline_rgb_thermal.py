@@ -515,20 +515,21 @@ def run_one(
     )
 
     polar, ref_src = load_reference_hr(subject, scenario)
+    hr_ref = float("nan")
     if polar is None:
         print("Referencja HR: brak pliku *_HR.csv — pomijam MAE/RMSE okienne")
     else:
-        src_lbl = "plik HR Polar (skip 5)"
+        hr_ref = float(np.median(polar.hr_bpm))
         print(
-            f"Referencja: {src_lbl} — {len(polar.hr_bpm)} próbek, "
-            f"mediana {float(np.median(polar.hr_bpm)):.1f} BPM, "
+            f"Referencja: plik HR Polar (bez skipu) — {len(polar.hr_bpm)} próbek, "
+            f"mediana {hr_ref:.1f} BPM, "
             f"średnia {float(polar.hr_bpm.mean()):.1f} BPM"
         )
 
     rows: list[dict] = []
     cleaned_store: dict[tuple[str, str, str], np.ndarray] = {}
     header = (
-        f"{'region':<12} {'metoda':<6} "
+        f"{'region':<12} {'metoda':<6} {'HR ref':>8} "
         f"{'HR plain':>10} {'HR gated':>10} {'ΔHR':>8} "
         f"{'SNR plain':>10} {'SNR gated':>10} {'ΔSNR':>8}"
     )
@@ -554,6 +555,7 @@ def run_one(
                 "mask_mode": mask_mode,
                 "region": region,
                 "method": name,
+                "hr_ref": hr_ref,
                 "hr_plain": float(hr_p),
                 "hr_gated": float(hr_g),
                 "d_hr": float(hr_g - hr_p),
@@ -610,8 +612,9 @@ def run_one(
             snr_g_s = f"{snr_g:>10.2f}" if np.isfinite(snr_g) else f"{'—':>10}"
             d_snr = row["d_snr"]
             d_snr_s = f"{d_snr:>+8.2f}" if np.isfinite(d_snr) else f"{'—':>8}"
+            hr_ref_s = f"{hr_ref:>8.1f}" if np.isfinite(hr_ref) else f"{'—':>8}"
             line = (
-                f"{region:<12} {name:<6} "
+                f"{region:<12} {name:<6} {hr_ref_s} "
                 f"{hr_p:>10.2f} {hr_g:>10.2f} {hr_g - hr_p:>+8.2f} "
                 f"{snr_p_s} {snr_g_s} {d_snr_s}"
             )
@@ -638,8 +641,8 @@ def run_one(
             else "Brak pliku *_HR.csv — ΔSNR = NaN."
         ),
         "",
-        "| region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| region | metoda | HR ref | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         mae_p = f"{row['mae_plain']:.2f}" if not np.isnan(row["mae_plain"]) else "—"
@@ -647,8 +650,9 @@ def run_one(
         snr_p = f"{row['snr_plain']:.2f}" if np.isfinite(row["snr_plain"]) else "—"
         snr_g = f"{row['snr_gated']:.2f}" if np.isfinite(row["snr_gated"]) else "—"
         d_snr = f"{row['d_snr']:+.2f}" if np.isfinite(row["d_snr"]) else "—"
+        hr_ref_s = f"{row['hr_ref']:.1f}" if np.isfinite(row["hr_ref"]) else "—"
         md.append(
-            f"| {row['region']} | {row['method']} | {row['hr_plain']:.2f} | "
+            f"| {row['region']} | {row['method']} | {hr_ref_s} | {row['hr_plain']:.2f} | "
             f"{row['hr_gated']:.2f} | {row['d_hr']:+.2f} | "
             f"{snr_p} | {snr_g} | {d_snr} | "
             f"{mae_p} | {mae_g} |"
@@ -686,6 +690,7 @@ def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
         "scenario",
         "region",
         "method",
+        "hr_ref",
         "hr_plain",
         "hr_gated",
         "d_hr",
@@ -726,13 +731,14 @@ def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
         "ΔSNR = średnia SNR okienna gated − plain, **względem referencji HR** (nie względem estymaty). "
         "MAE: okna 10 s vs ta sama referencja. ΔMAE = gated − plain.",
         "",
-        "| subject | scenario | region | metoda | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | ΔMAE |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+        "| subject | scenario | region | metoda | HR ref | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | ΔMAE |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in all_rows:
         mae_p = row.get("mae_plain", float("nan"))
         mae_g = row.get("mae_gated", float("nan"))
         d_snr = row.get("d_snr", float("nan"))
+        hr_ref = row.get("hr_ref", float("nan"))
         if np.isnan(mae_p) or np.isnan(mae_g):
             mae_p_s, mae_g_s, d_mae_s = "—", "—", "—"
         else:
@@ -740,9 +746,10 @@ def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
             mae_g_s = f"{mae_g:.2f}"
             d_mae_s = f"{mae_g - mae_p:+.2f}"
         d_snr_s = f"{d_snr:+.2f}" if np.isfinite(d_snr) else "—"
+        hr_ref_s = f"{hr_ref:.1f}" if np.isfinite(hr_ref) else "—"
         lines.append(
             f"| {row['subject']} | {row['scenario']} | {row['region']} | {row['method']} | "
-            f"{row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {d_snr_s} | "
+            f"{hr_ref_s} | {row['hr_plain']:.2f} | {row['hr_gated']:.2f} | {d_snr_s} | "
             f"{mae_p_s} | {mae_g_s} | {d_mae_s} |"
         )
 

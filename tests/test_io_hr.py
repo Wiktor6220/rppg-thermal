@@ -30,8 +30,9 @@ def test_load_reference_hr_is_hr_csv_only():
     assert series is not None
     assert src == "hr_csv"
     assert series.hr_bpm.size >= 10
-    # t_s względem pierwszego wiersza danych; po skip pierwsza próbka ≥ skip sekund
-    assert float(series.t_s.min()) >= float(POLAR_HR_SKIP_SAMPLES) - 0.5
+    # Bez skipu: pierwsza próbka ≈ start wideo (t_s ≈ 0)
+    assert POLAR_HR_SKIP_SAMPLES == 0
+    assert float(series.t_s.min()) < 1.0
 
 
 @pytest.mark.skipif(not HAS_S02, reason=f"brak data/{EVAL_SUBJECT}/s1_rest_rest")
@@ -42,8 +43,8 @@ def test_load_polar_hr_s02_s1_resting_range():
     assert 50.0 <= med <= 100.0
 
 
-def test_load_polar_hr_time_axis_starts_after_skip(tmp_path, monkeypatch):
-    """t0 = pierwszy wiersz danych; po skip=5 pierwsza próbka ma t_s == 5.0."""
+def test_load_polar_hr_no_skip_starts_at_zero(tmp_path, monkeypatch):
+    """t0 = pierwszy wiersz; przy skip=0 pierwsza próbka ma t_s == 0."""
     session = tmp_path / "subject99" / "s1_rest_rest"
     session.mkdir(parents=True)
     hr_path = session / "subject99_s1_HR.csv"
@@ -56,7 +57,7 @@ def test_load_polar_hr_time_axis_starts_after_skip(tmp_path, monkeypatch):
         "src.io_layer.find_polar_hr_path",
         lambda subject, scenario, data_dir=None: hr_path,
     )
-    series = load_polar_hr("subject99", "s1_rest_rest", data_dir=tmp_path, skip_samples=5)
+    series = load_polar_hr("subject99", "s1_rest_rest", data_dir=tmp_path, skip_samples=0)
     assert series is not None
-    assert series.t_s[0] == 5.0
-    assert len(series.hr_bpm) == 5
+    assert series.t_s[0] == 0.0
+    assert len(series.hr_bpm) == 10

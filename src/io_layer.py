@@ -360,11 +360,11 @@ def load_polar_hr(
     skip_samples: int = POLAR_HR_SKIP_SAMPLES,
     hr_column: int = POLAR_HR_COLUMN,
 ) -> PolarHrSeries | None:
-    """Wczytuje HR z Polara H10: kolumna BPM, pomija pierwsze ``skip_samples`` po nagłówku.
+    """Wczytuje HR z Polara H10: kolumna BPM; opcjonalnie pomija pierwsze ``skip_samples``.
 
-    Czas ``t_s`` jest względem **pierwszego wiersza danych** (start wideo), nie względem
-    pierwszej zachowanej próbki po skipie — dzięki temu t ≈ skip_samples sekund, a nie 0.
-    Zwraca None, gdy brak pliku (np. subject01/s5).
+    Czas ``t_s`` jest względem **pierwszego wiersza danych** (start wideo).
+    Przy ``skip_samples=0`` (domyślnie dla subject02) pierwsza próbka ma ``t_s ≈ 0``.
+    Zwraca None, gdy brak pliku.
     """
     path = find_polar_hr_path(subject, scenario, data_dir)
     if path is None:

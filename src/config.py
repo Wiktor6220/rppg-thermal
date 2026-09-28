@@ -40,9 +40,9 @@ PERFUSION_TEMP_STD_FACTOR: float = 0.5
 PERFUSION_MIN_ROI_FRAC: float = 0.10
 
 # --- Referencja Polar H10 (tylko HR.csv w walidacji) ---
-# Kolumna 4 (1-based) = BPM; pierwsze N próbek = kalibracja / skip.
+# Kolumna 4 (1-based) = BPM. subject02: dane dobre od startu — bez obcinania.
 POLAR_HR_COLUMN: int = 3  # 0-based
-POLAR_HR_SKIP_SAMPLES: int = 5
+POLAR_HR_SKIP_SAMPLES: int = 0
 # Stałe EKG poniżej: tylko dla opcjonalnych skryptów diagnostycznych (nie walidacja).
 ECG_FS_HZ: float = 130.0
 ECG_SKIP_SEC: float = 10.0
