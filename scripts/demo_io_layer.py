@@ -1,4 +1,4 @@
-"""Demo io_layer: metadane i pierwsza klatka RGB/termika (subject01/s1)."""
+"""Demo io_layer: metadane i pierwsza klatka RGB/termika (EVAL_SUBJECT/s1)."""
 
 import sys
 from pathlib import Path
@@ -8,7 +8,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.io_layer import VideoMeta, list_recordings, load_recording  # noqa: E402
+from src.config import EVAL_SUBJECT  # noqa: E402
+from src.io_layer import VideoMeta, list_eval_recordings, load_recording  # noqa: E402
 
 
 def _print_meta(label: str, meta: VideoMeta) -> None:
@@ -26,9 +27,9 @@ def _first_frame_shape(frames_iter) -> tuple[int, ...] | None:
 
 
 def main() -> None:
-    print(f"Dostępne kompletne nagrania (RGB+termika): {len(list_recordings())}")
+    print(f"Nagrania eval ({EVAL_SUBJECT}): {len(list_eval_recordings())}")
 
-    loaded = load_recording("subject01", "s1_rest_rest")
+    loaded = load_recording(EVAL_SUBJECT, "s1_rest_rest")
     rec = loaded.recording
     print(f"\nNagranie: {rec.subject} / {rec.scenario} (kod {rec.scenario_code})")
     print(f"  rgb    : {rec.rgb_path.name}")

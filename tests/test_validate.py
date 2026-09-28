@@ -89,8 +89,17 @@ def test_compute_mae_all_nan_returns_nan():
 
 
 def test_delta_snr_near_zero_for_equal_quality_signals():
-    """Dwa sygnały o równej jakości → średnie ΔSNR bliskie 0 (brak obciążenia metryki)."""
+    """Dwa sygnały równej jakości przy szumie różowym / niskim SNR → ΔSNR ≈ 0."""
     from src.validate import validate_against_hr_series
+
+    def pink(n, rng):
+        freqs = np.fft.rfftfreq(n)
+        phases = rng.standard_normal(freqs.shape) + 1j * rng.standard_normal(freqs.shape)
+        phases[0] = 0.0
+        mag = np.ones_like(freqs)
+        mag[1:] = 1.0 / np.sqrt(freqs[1:])
+        out = np.fft.irfft(phases * mag, n=n).real
+        return out / (out.std() + 1e-12)
 
     fs = 30.0
     duration_s = 40.0
@@ -102,15 +111,22 @@ def test_delta_snr_near_zero_for_equal_quality_signals():
     rng = np.random.default_rng(7)
     deltas = []
     for _ in range(200):
-        noise_a = rng.standard_normal(n)
-        noise_b = rng.standard_normal(n)
         pulse = np.sin(2 * np.pi * (true_hr / 60.0) * t)
-        # Identyczna jakość: ten sam SNR (amplituda pulsu / skala szumu).
-        sig_a = pulse + 0.5 * noise_a
-        sig_b = pulse + 0.5 * noise_b
+        # Niski SNR + 1/f — tu stara metryka „vs estymata plain” się psuła.
+        sig_a = pulse + 2.5 * pink(n, rng)
+        sig_b = pulse + 2.5 * pink(n, rng)
         va = validate_against_hr_series(sig_a, fs, ref_t, ref_hr)
         vb = validate_against_hr_series(sig_b, fs, ref_t, ref_hr)
         if np.isfinite(va["snr_mean"]) and np.isfinite(vb["snr_mean"]):
             deltas.append(vb["snr_mean"] - va["snr_mean"])
     assert len(deltas) >= 150
     assert abs(float(np.mean(deltas))) < 0.15
+
+
+def test_octave_error_fraction():
+    from src.validate import octave_error_fraction
+
+    est = np.array([60.0, 120.0, 70.0, 35.0])
+    ref = np.array([60.0, 60.0, 70.0, 70.0])
+    # 120≈2×60, 35≈0.5×70 → 2/4
+    assert abs(octave_error_fraction(est, ref) - 0.5) < 1e-9

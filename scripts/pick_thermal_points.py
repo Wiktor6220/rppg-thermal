@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 
 import matplotlib.pyplot as plt  # noqa: E402 - GUI backend (bez Agg, potrzebny ginput)
 
+from src.config import EVAL_SUBJECT  # noqa: E402
 from src.io_layer import load_recording  # noqa: E402
 
 # Kolejność MUSI odpowiadać punktom kontrolnym w probe_registration.py.
@@ -21,7 +22,7 @@ LABELS = [
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Klikanie punktów termicznych (ginput).")
-    parser.add_argument("--subject", default="subject01")
+    parser.add_argument("--subject", default=EVAL_SUBJECT)
     parser.add_argument("--scenario", default="s1_rest_rest")
     args = parser.parse_args()
 

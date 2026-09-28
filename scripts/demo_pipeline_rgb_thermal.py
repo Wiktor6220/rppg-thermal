@@ -37,18 +37,20 @@ from src.config import (  # noqa: E402
     AFFINE_FIXED_MEDIAN_N,
     BAND_HIGH_HZ,
     BAND_LOW_HZ,
+    EVAL_SUBJECT,
     RESULTS_DIR,
     VALIDATION_WINDOW_SEC,
 )
 from src.extract import (  # noqa: E402
-    affine_translation_iqr_px,
+    affine_point_dispersion_px,
+    consensus_median_affine,
     gated_means_per_frame_from_samples,
     gated_means_per_window_from_samples,
     mean_rgb_in_mask,
-    median_affine,
     sample_roi_temps_via_affine,
+    thermal_probe_points,
 )
-from src.io_layer import list_recordings, load_recording, load_reference_hr  # noqa: E402
+from src.io_layer import list_eval_recordings, load_recording, load_reference_hr  # noqa: E402
 from src.registration import (  # noqa: E402
     apply_affine,
     estimate_affine_thermal_to_rgb,
@@ -84,7 +86,11 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Porównanie RGB vs RGB+termika (jedno nagranie lub --all)."
     )
-    parser.add_argument("--subject", default="subject01", help="np. subject01, subject02")
+    parser.add_argument(
+        "--subject",
+        default=EVAL_SUBJECT,
+        help=f"np. subject02 (domyślnie {EVAL_SUBJECT}; subject01 poza eksperymentem)",
+    )
     parser.add_argument(
         "--scenario",
         default="s1_rest_rest",
@@ -183,6 +189,21 @@ def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return mask
 
 
+def _shrink_bbox(bbox: np.ndarray, frac: float = 0.20) -> np.ndarray:
+    """Zawęża bbox o ``frac`` od każdej krawędzi (kontrola confoundu „maska skóry")."""
+    y0, x0, y1, x1 = (float(v) for v in bbox)
+    h, w = y1 - y0, x1 - x0
+    return np.array(
+        [
+            y0 + frac * h,
+            x0 + frac * w,
+            y1 - frac * h,
+            x1 - frac * w,
+        ],
+        dtype=np.float64,
+    )
+
+
 def _region_boxes(landmarks: np.ndarray) -> dict[str, np.ndarray]:
     """Bboxy ROI do ekstrakcji: czoło + lewy/prawy policzek (bez nosa/ust)."""
     return {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS_EXTRACT}
@@ -224,22 +245,35 @@ def _collect_fixed_median_affine(
     loaded,
     detector,
     n_target: int = AFFINE_FIXED_MEDIAN_N,
-) -> tuple[np.ndarray | None, list[np.ndarray]]:
-    """Pass 1: zbiera udane estymaty affine z początku nagrania → mediana."""
+) -> tuple[np.ndarray | None, list[np.ndarray], dict[str, float]]:
+    """Pass 1: zbiera udane estymaty → consensus mediana pozycji punktów."""
     samples: list[np.ndarray] = []
+    probe_pts: np.ndarray | None = None
     for rgb, thermal, _ in loaded.synced_pairs(reference="rgb"):
         landmarks = detector(rgb)
         if landmarks is None:
             continue
-        new_affine, _info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
+        new_affine, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
         if new_affine is None:
             continue
         samples.append(new_affine.astype(np.float64))
+        if probe_pts is None and isinstance(info, dict):
+            probe_pts = thermal_probe_points(info["thermal_mask"])
         if len(samples) >= n_target:
             break
     if not samples:
-        return None, []
-    return median_affine(samples), samples
+        return None, [], {"median_abs_dev": float("nan"), "iqr_radial": float("nan"),
+                          "max_median_dev": float("nan"), "consensus_resid": float("nan")}
+    if probe_pts is None:
+        # fallback: siatka nominalna w termice
+        probe_pts = np.array(
+            [[640.0, 400.0], [500.0, 550.0], [780.0, 550.0], [640.0, 700.0]],
+            dtype=np.float64,
+        )
+    disp = affine_point_dispersion_px(samples, probe_pts)
+    aff, resid = consensus_median_affine(samples, probe_pts)
+    disp["consensus_resid"] = resid
+    return aff, samples, disp
 
 
 def run_one(
@@ -261,6 +295,13 @@ def run_one(
     use_manual = manual_gt is not None
     if use_manual:
         affine_mode = "manual"
+    # s5: dystans zmienny → fixed-median fizycznie błędne
+    if affine_mode == "fixed-median" and scenario.startswith("s5_"):
+        print(
+            f"  [warn] s5 + fixed-median → wymuszam refresh "
+            f"(zmienny dystans; stała affine błędna)"
+        )
+        affine_mode = "refresh"
     affine_every = _affine_every(scenario)
     print(f"\n{'=' * 60}")
     print(f"Nagranie: {subject}/{scenario}  {n_frames} klatek @ {fs:.3f} fps")
@@ -269,24 +310,32 @@ def run_one(
     gt = None
     fixed_affine: np.ndarray | None = None
     affine_samples: list[np.ndarray] = []
+    aff_disp: dict[str, float] = {
+        "median_abs_dev": float("nan"),
+        "iqr_radial": float("nan"),
+        "max_median_dev": float("nan"),
+        "consensus_resid": float("nan"),
+    }
+    refresh_probe_pts: np.ndarray | None = None
 
     if use_manual:
         print(f"Affine: RĘCZNA stała z GT  ({manual_gt})")
         gt = json.loads(manual_gt.read_text(encoding="utf-8"))
     elif affine_mode == "fixed-median":
         print(
-            f"Affine: FIXED-MEDIAN (cel {AFFINE_FIXED_MEDIAN_N} udanych estymat z początku)"
+            f"Affine: FIXED-MEDIAN consensus (cel {AFFINE_FIXED_MEDIAN_N} estymat)"
         )
-        fixed_affine, affine_samples = _collect_fixed_median_affine(loaded, detector)
+        fixed_affine, affine_samples, aff_disp = _collect_fixed_median_affine(
+            loaded, detector
+        )
         if fixed_affine is None:
             print("  [warn] brak udanych affine — gated = plain")
         else:
-            iqr_x, iqr_y = affine_translation_iqr_px(affine_samples)
             print(
-                f"  Mediana z {len(affine_samples)} estymat; "
-                f"IQR tx={iqr_x:.1f} px, ty={iqr_y:.1f} px"
+                f"  n={len(affine_samples)}; punktowy MAD={aff_disp['median_abs_dev']:.1f} px, "
+                f"IQR radial={aff_disp['iqr_radial']:.1f} px, "
+                f"residuum consensus={aff_disp['consensus_resid']:.1f} px"
             )
-        # Nowy przebieg wideo po pass 1
         loaded = load_recording(subject, scenario)
     else:
         print(f"Affine: REFRESH co {affine_every} klatek")
@@ -294,6 +343,7 @@ def run_one(
     print(f"Maska: {mask_mode}")
 
     plain_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+    plain_shrink_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
     rgb_pix: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
     temps_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
     valid_list: list[bool] = []
@@ -320,6 +370,8 @@ def run_one(
             roi_mask = _bbox_to_mask(boxes[region], (h, w))
             plain = mean_rgb_in_mask(rgb, roi_mask)
             plain_lists[region].append(plain)
+            shrink_mask = _bbox_to_mask(_shrink_bbox(boxes[region], 0.20), (h, w))
+            plain_shrink_lists[region].append(mean_rgb_in_mask(rgb, shrink_mask))
             if affine is None:
                 rgb_pix[region].append(None)
                 temps_lists[region].append(None)
@@ -354,6 +406,8 @@ def run_one(
                         affine = new_affine.astype(np.float64)
                         n_affine_ok += 1
                         refresh_samples.append(affine)
+                        if refresh_probe_pts is None and isinstance(info, dict):
+                            refresh_probe_pts = thermal_probe_points(info["thermal_mask"])
                     else:
                         n_affine_fail += 1
                         if i == 0:
@@ -386,13 +440,24 @@ def run_one(
             valid_list.append(False)
             for region in REGIONS_EXTRACT:
                 plain_lists[region].append(full)
+                plain_shrink_lists[region].append(full)
                 rgb_pix[region].append(None)
                 temps_lists[region].append(None)
 
     if affine_mode == "refresh" and refresh_samples:
-        iqr_x, iqr_y = affine_translation_iqr_px(refresh_samples)
-        print(f"Affine refresh: IQR tx={iqr_x:.1f} px, ty={iqr_y:.1f} px "
-              f"(n={len(refresh_samples)})")
+        if refresh_probe_pts is None:
+            refresh_probe_pts = np.array(
+                [[640.0, 400.0], [500.0, 550.0], [780.0, 550.0], [640.0, 700.0]],
+                dtype=np.float64,
+            )
+        aff_disp = affine_point_dispersion_px(refresh_samples, refresh_probe_pts)
+        print(
+            f"Affine refresh stabilność (punkty→RGB): "
+            f"MAD={aff_disp['median_abs_dev']:.1f} px, "
+            f"IQR radial={aff_disp['iqr_radial']:.1f} px, "
+            f"maxMAD={aff_disp['max_median_dev']:.1f} px "
+            f"(n={len(refresh_samples)})"
+        )
 
     valid = np.array(valid_list, dtype=bool)
     plain_ex = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
@@ -415,10 +480,25 @@ def run_one(
         gated_ex[region] = gated_arr
         fallback_fracs[region] = float(np.mean(fb)) if len(fb) else float("nan")
 
-    fallback_pct = float(np.nanmean([fallback_fracs[r] for r in REGIONS_EXTRACT]) * 100.0)
+    fallback_pct = float(np.nanmean(list(fallback_fracs.values())) * 100.0)
+    fb_fore = fallback_fracs.get("forehead", float("nan")) * 100.0
+    fb_cheek = float(
+        np.nanmean(
+            [fallback_fracs["left_cheek"], fallback_fracs["right_cheek"]]
+        )
+        * 100.0
+    )
     plain = {
         "forehead": plain_ex["forehead"],
         "cheeks": 0.5 * (plain_ex["left_cheek"] + plain_ex["right_cheek"]),
+    }
+    plain_shrink_ex = {
+        r: np.asarray(v, dtype=np.float64) for r, v in plain_shrink_lists.items()
+    }
+    plain_shrink = {
+        "forehead": plain_shrink_ex["forehead"],
+        "cheeks": 0.5
+        * (plain_shrink_ex["left_cheek"] + plain_shrink_ex["right_cheek"]),
     }
     gated = {
         "forehead": gated_ex["forehead"],
@@ -430,14 +510,15 @@ def run_one(
     )
     print(
         f"Leading ROI fill: {n_leading_filled} klatek; "
-        f"gated fallback: {fallback_pct:.1f}% klatek"
+        f"fallback forehead={fb_fore:.1f}%, cheeks={fb_cheek:.1f}% "
+        f"(śr. {fallback_pct:.1f}%)"
     )
 
     polar, ref_src = load_reference_hr(subject, scenario)
     if polar is None:
-        print("Referencja HR: brak EKG i pliku HR — pomijam MAE/RMSE okienne")
+        print("Referencja HR: brak pliku *_HR.csv — pomijam MAE/RMSE okienne")
     else:
-        src_lbl = "EKG (neurokit2, skip 10 s)" if ref_src == "ecg" else "plik HR (skip 5)"
+        src_lbl = "plik HR Polar (skip 5)"
         print(
             f"Referencja: {src_lbl} — {len(polar.hr_bpm)} próbek, "
             f"mediana {float(np.median(polar.hr_bpm)):.1f} BPM, "
@@ -487,9 +568,16 @@ def run_one(
                 "ref_src": ref_src if polar is not None else "none",
                 "valid_pct": float(100.0 * valid.mean()),
                 "fallback_pct": fallback_pct,
+                "fallback_pct_forehead": float(fb_fore),
+                "fallback_pct_cheeks": float(fb_cheek),
                 "leading_fill": n_leading_filled,
                 "affine_ok": n_affine_ok,
                 "affine_fail": n_affine_fail,
+                "affine_mad_px": float(aff_disp.get("median_abs_dev", float("nan"))),
+                "affine_iqr_radial_px": float(aff_disp.get("iqr_radial", float("nan"))),
+                "mae_plain_shrink": float("nan"),
+                "octave_frac_plain": float("nan"),
+                "octave_frac_gated": float("nan"),
             }
             if polar is not None:
                 vp = validate.validate_against_hr_series(
@@ -498,14 +586,21 @@ def run_one(
                 vg = validate.validate_against_hr_series(
                     sig_g, fs, polar.t_s, polar.hr_bpm, valid=valid
                 )
+                sig_sh = method_fn(plain_shrink[region], fs)
+                vsh = validate.validate_against_hr_series(
+                    sig_sh, fs, polar.t_s, polar.hr_bpm, valid=valid
+                )
                 row["mae_plain"] = float(vp["mae_bpm"])
                 row["mae_gated"] = float(vg["mae_bpm"])
+                row["mae_plain_shrink"] = float(vsh["mae_bpm"])
                 row["rmse_plain"] = float(vp["rmse_bpm"])
                 row["rmse_gated"] = float(vg["rmse_bpm"])
                 row["n_windows"] = int(vp["n_windows_used"])
                 row["snr_plain"] = float(vp["snr_mean"])
                 row["snr_gated"] = float(vg["snr_mean"])
                 row["d_snr"] = float(vg["snr_mean"] - vp["snr_mean"])
+                row["octave_frac_plain"] = float(vp["octave_error_frac"])
+                row["octave_frac_gated"] = float(vg["octave_error_frac"])
                 snr_p = row["snr_plain"]
                 snr_g = row["snr_gated"]
             rows.append(row)
@@ -536,11 +631,11 @@ def run_one(
         f"# RGB vs RGB+termika — {subject}/{scenario}",
         "",
         mode_note,
-        "SNR w oknach 10 s **względem referencji** (EKG/HR), nie względem estymaty. "
+        "SNR w oknach 10 s **względem Polar HR.csv**, nie względem estymaty. "
         + (
             "MAE: okna 10 s vs ta sama referencja."
             if polar is not None
-            else "Brak referencji HR/EKG — ΔSNR = NaN."
+            else "Brak pliku *_HR.csv — ΔSNR = NaN."
         ),
         "",
         "| region | metoda | HR plain | HR gated | ΔHR | SNR plain | SNR gated | ΔSNR | MAE plain | MAE gated |",
@@ -581,10 +676,11 @@ def run_one(
     return rows
 
 
-def _write_summary(all_rows: list[dict]) -> Path:
+def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
     """Zbiorcza tabela markdown + CSV dla wszystkich przebiegów."""
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
-    csv_path = OUT_ROOT / "summary_all.csv"
+    suffix = f"_{tag}" if tag else ""
+    csv_path = OUT_ROOT / f"summary_all{suffix}.csv"
     fieldnames = [
         "subject",
         "scenario",
@@ -604,11 +700,18 @@ def _write_summary(all_rows: list[dict]) -> Path:
         "ref_src",
         "valid_pct",
         "fallback_pct",
+        "fallback_pct_forehead",
+        "fallback_pct_cheeks",
         "leading_fill",
         "affine_mode",
         "mask_mode",
         "affine_ok",
         "affine_fail",
+        "affine_mad_px",
+        "affine_iqr_radial_px",
+        "mae_plain_shrink",
+        "octave_frac_plain",
+        "octave_frac_gated",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -616,7 +719,7 @@ def _write_summary(all_rows: list[dict]) -> Path:
         for row in all_rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
-    md_path = OUT_ROOT / "summary_all.md"
+    md_path = OUT_ROOT / f"summary_all{suffix}.md"
     lines = [
         "# Zbiorcze porównanie RGB vs RGB+termika (wszystkie nagrania)",
         "",
@@ -643,26 +746,12 @@ def _write_summary(all_rows: list[dict]) -> Path:
             f"{mae_p_s} | {mae_g_s} | {d_mae_s} |"
         )
 
-    lines.extend(["", "## Średnie ΔSNR [dB] (gated − plain, tylko nagrania z referencją)", ""])
-    lines.append("| region | metoda | średnie ΔSNR | n |")
-    lines.append("|---|---|---:|---:|")
-    for region in REGIONS_REPORT:
-        for method in METHODS:
-            vals = [
-                r["d_snr"]
-                for r in all_rows
-                if r["region"] == region
-                and r["method"] == method
-                and np.isfinite(r.get("d_snr", float("nan")))
-            ]
-            if vals:
-                lines.append(
-                    f"| {region} | {method} | {float(np.mean(vals)):+.2f} | {len(vals)} |"
-                )
-
-    lines.extend(["", "## Średnie MAE vs referencja [BPM] (okna 10 s)", ""])
-    lines.append("| region | metoda | MAE plain | MAE gated | ΔMAE | n |")
-    lines.append("|---|---|---:|---:|---:|---:|")
+    lines.extend(["", "## ΔSNR i ΔMAE — średnia oraz mediana", ""])
+    lines.append(
+        "| region | metoda | mean ΔSNR | med ΔSNR | mean ΔMAE | med ΔMAE | "
+        "oktawa plain | n |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
     for region in REGIONS_REPORT:
         for method in METHODS:
             subset = [
@@ -670,15 +759,79 @@ def _write_summary(all_rows: list[dict]) -> Path:
                 for r in all_rows
                 if r["region"] == region
                 and r["method"] == method
-                and not np.isnan(r.get("mae_plain", float("nan")))
+                and np.isfinite(r.get("mae_plain", float("nan")))
             ]
             if not subset:
                 continue
-            mp = float(np.mean([r["mae_plain"] for r in subset]))
-            mg = float(np.mean([r["mae_gated"] for r in subset]))
+            dsnr = [r["d_snr"] for r in subset if np.isfinite(r.get("d_snr", float("nan")))]
+            dmae = [r["mae_gated"] - r["mae_plain"] for r in subset]
+            oct_p = [
+                r["octave_frac_plain"]
+                for r in subset
+                if np.isfinite(r.get("octave_frac_plain", float("nan")))
+            ]
+            dsnr_mean = f"{float(np.mean(dsnr)):+.2f}" if dsnr else "—"
+            dsnr_med = f"{float(np.median(dsnr)):+.2f}" if dsnr else "—"
+            oct_s = f"{float(np.mean(oct_p)) * 100:.0f}%" if oct_p else "—"
             lines.append(
-                f"| {region} | {method} | {mp:.2f} | {mg:.2f} | {mg - mp:+.2f} | {len(subset)} |"
+                f"| {region} | {method} | {dsnr_mean} | {dsnr_med} | "
+                f"{float(np.mean(dmae)):+.2f} | {float(np.median(dmae)):+.2f} | "
+                f"{oct_s} | {len(subset)} |"
             )
+
+    # Podzbiór „baseline działa": wyłącznie na plain MAE < 15 (przed gated).
+    PLAIN_OK = 15.0
+    lines.extend(
+        [
+            "",
+            f"## Podzbiór baseline działa (plain MAE < {PLAIN_OK:.0f} BPM — kryterium tylko z plain)",
+            "",
+        ]
+    )
+    lines.append("| region | metoda | mean ΔMAE | med ΔMAE | n |")
+    lines.append("|---|---|---:|---:|---:|")
+    for region in REGIONS_REPORT:
+        for method in METHODS:
+            subset = [
+                r
+                for r in all_rows
+                if r["region"] == region
+                and r["method"] == method
+                and np.isfinite(r.get("mae_plain", float("nan")))
+                and r["mae_plain"] < PLAIN_OK
+            ]
+            if not subset:
+                lines.append(f"| {region} | {method} | — | — | 0 |")
+                continue
+            dmae = [r["mae_gated"] - r["mae_plain"] for r in subset]
+            lines.append(
+                f"| {region} | {method} | {float(np.mean(dmae)):+.2f} | "
+                f"{float(np.median(dmae)):+.2f} | {len(subset)} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Policzki: gated vs plain vs plain_shrink (−20% bbox)",
+            "",
+            "Gated musi bić **plain_shrink**, nie tylko plain (confound maski skóry).",
+            "",
+        ]
+    )
+    lines.append("| subject | scenario | metoda | MAE plain | MAE shrink | MAE gated |")
+    lines.append("|---|---|---|---:|---:|---:|")
+    for r in all_rows:
+        if r["region"] != "cheeks":
+            continue
+        if not np.isfinite(r.get("mae_plain", float("nan"))):
+            continue
+        sh = r.get("mae_plain_shrink", float("nan"))
+        sh_s = f"{sh:.2f}" if np.isfinite(sh) else "—"
+        lines.append(
+            f"| {r['subject']} | {r['scenario']} | {r['method']} | "
+            f"{r['mae_plain']:.2f} | {sh_s} | {r['mae_gated']:.2f} |"
+        )
+
     lines.append("")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return md_path
@@ -693,14 +846,17 @@ def main() -> None:
             "--all z --manual-gt nie jest wspierane (każde nagranie ma własny GT). "
             "Odpalaj pojedynczo, np.:\n"
             "  uv run python scripts/demo_pipeline_rgb_thermal.py "
-            "--subject subject01 --scenario s1_rest_rest --manual-gt auto"
+            f"--subject {EVAL_SUBJECT} --scenario s1_rest_rest --manual-gt auto"
         )
 
     if args.all:
-        recordings = list_recordings()
+        recordings = list_eval_recordings()
         if not recordings:
-            raise SystemExit("Brak kompletnych nagrań w data/.")
-        print(f"--all: {len(recordings)} nagrań")
+            raise SystemExit(
+                f"Brak nagrań {EVAL_SUBJECT} w data/ "
+                "(subject01 jest pomijany w eksperymencie)."
+            )
+        print(f"--all: {len(recordings)} nagrań ({EVAL_SUBJECT} only, ref=HR.csv)")
         all_rows: list[dict] = []
         failures: list[str] = []
         for rec in recordings:
@@ -717,9 +873,12 @@ def main() -> None:
                 msg = f"{rec.subject}/{rec.scenario}: {exc}"
                 print(f"[FAIL] {msg}")
                 failures.append(msg)
-        summary = _write_summary(all_rows)
+        tag = f"{args.affine_mode}_{args.mask_mode}".replace("-", "")
+        if tag == "refresh_perframe":
+            tag = ""  # baseline bez sufiksu
+        summary = _write_summary(all_rows, tag=tag)
         print(f"\n=== Zbiorczo: {len(all_rows)} wierszy → {summary} ===")
-        print(f"CSV: {OUT_ROOT / 'summary_all.csv'}")
+        print(f"CSV: {summary.with_suffix('.csv')}")
         if failures:
             print(f"Nieudane ({len(failures)}):")
             for msg in failures:
@@ -727,6 +886,11 @@ def main() -> None:
         return
 
     gt_path: Path | None = None
+    if args.subject != EVAL_SUBJECT:
+        print(
+            f"[warn] subject={args.subject} poza EVAL_SUBJECT={EVAL_SUBJECT} "
+            "— wyniki nie wchodzą do głównego zestawienia tezy."
+        )
     if args.manual_gt:
         gt_path = _resolve_manual_gt(args.subject, args.scenario, args.manual_gt)
         print(f"Tryb ręcznej affine: {gt_path}")

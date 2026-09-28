@@ -219,7 +219,7 @@ def validate_against_hr_series(
     min_valid_ratio: float = MIN_VALID_RATIO,
     hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
 ) -> dict:
-    """Waliduje rPPG względem serii HR (EKG/Polar) w oknach 10 s.
+    """Waliduje rPPG względem serii Polar ``*_HR.csv`` w oknach 10 s.
 
     W każdym oknie: HR z Welcha oraz mediana referencji w ``[t0, t0+window_s)``.
     SNR liczone **względem referencyjnego HR** na oczyszczonym oknie (nie względem
@@ -270,6 +270,7 @@ def validate_against_hr_series(
     metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
     snr_used = snr_db[window_used & np.isfinite(snr_db)]
     snr_mean = float(np.mean(snr_used)) if snr_used.size else float("nan")
+    octave_frac = float(octave_error_fraction(estimated_hr_bpm, reference_hr_bpm))
     return {
         "window_start_s": window_start_s,
         "estimated_hr_bpm": estimated_hr_bpm,
@@ -277,9 +278,27 @@ def validate_against_hr_series(
         "error_bpm": error_bpm,
         "snr_db": snr_db,
         "snr_mean": snr_mean,
+        "octave_error_frac": octave_frac,
         "window_used": window_used,
         "n_windows_total": n_windows,
         "n_windows_used": metrics["n_windows_used"],
         "mae_bpm": metrics["mae_bpm"],
         "rmse_bpm": metrics["rmse_bpm"],
     }
+
+
+def octave_error_fraction(
+    estimated_hr: np.ndarray,
+    reference_hr: np.ndarray,
+    rel_tol: float = 0.15,
+) -> float:
+    """Odsetek okien z estymatą ≈ 2× lub ½× referencji (błąd oktawowy)."""
+    est = np.asarray(estimated_hr, dtype=np.float64)
+    ref = np.asarray(reference_hr, dtype=np.float64)
+    ok = np.isfinite(est) & np.isfinite(ref) & (ref > 0)
+    if not np.any(ok):
+        return float("nan")
+    e, r = est[ok], ref[ok]
+    ratio = e / r
+    is_oct = (np.abs(ratio - 2.0) <= rel_tol) | (np.abs(ratio - 0.5) <= rel_tol)
+    return float(np.mean(is_oct))

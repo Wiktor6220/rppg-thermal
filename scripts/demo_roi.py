@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from src.config import RESULTS_DIR  # noqa: E402
+from src.config import EVAL_SUBJECT, RESULTS_DIR  # noqa: E402
 from src.io_layer import load_recording  # noqa: E402
 from src.roi import (  # noqa: E402
     make_cropping_detector,
@@ -112,7 +112,7 @@ def _multi_roi_builder(landmarks: np.ndarray, region: str) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Detekcja twarzy i ROI na jednym nagraniu RGB.")
-    parser.add_argument("--subject", default="subject01")
+    parser.add_argument("--subject", default=EVAL_SUBJECT)
     parser.add_argument("--scenario", default="s1_rest_rest")
     parser.add_argument("--num-preview", type=int, default=16)
     args = parser.parse_args()

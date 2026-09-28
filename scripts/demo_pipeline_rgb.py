@@ -19,7 +19,7 @@ import numpy as np  # noqa: E402
 from scipy.signal import welch  # noqa: E402 - tylko do WIZUALIZACJI widma
 
 from src import estimate, extract, methods  # noqa: E402
-from src.config import BAND_HIGH_HZ, BAND_LOW_HZ, RESULTS_DIR  # noqa: E402
+from src.config import BAND_HIGH_HZ, BAND_LOW_HZ, EVAL_SUBJECT, RESULTS_DIR  # noqa: E402
 from src.io_layer import load_recording  # noqa: E402
 from src.roi import (  # noqa: E402
     make_cropping_detector,
@@ -29,7 +29,7 @@ from src.roi import (  # noqa: E402
 
 REGIONS = ["forehead", "left_cheek", "right_cheek"]
 METHODS = {"CHROM": methods.chrom, "POS": methods.pos}
-SUBJECT, SCENARIO = "subject01", "s1_rest_rest"
+SUBJECT, SCENARIO = EVAL_SUBJECT, "s1_rest_rest"
 
 
 def _multi_roi_builder(landmarks: np.ndarray, region: str) -> np.ndarray:
@@ -62,7 +62,7 @@ def _plot_raw_rgb(t, trace, out_dir) -> None:
     ax.set_xlim(0, 10)
     ax.set_xlabel("czas [s]")
     ax.set_ylabel("średnia wartość kanału w ROI [j.u.]")
-    ax.set_title("Surowe średnie RGB w ROI (forehead) — subject01/s1")
+    ax.set_title(f"Surowe średnie RGB w ROI (forehead) — {SUBJECT}/s1")
     ax.legend(loc="upper right")
     fig.savefig(out_dir / "raw_rgb_forehead.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -76,7 +76,7 @@ def _plot_method_signals(t, signals, out_dir) -> None:
     ax.set_xlim(2, 10)
     ax.set_xlabel("czas [s]")
     ax.set_ylabel("sygnał rPPG (standaryzowany)")
-    ax.set_title("Sygnał rPPG po CHROM i POS (forehead) — subject01/s1")
+    ax.set_title(f"Sygnał rPPG po CHROM i POS (forehead) — {SUBJECT}/s1")
     ax.legend(loc="upper right")
     fig.savefig(out_dir / "chrom_pos_forehead.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -91,14 +91,14 @@ def _plot_spectrum(cleaned_signals, hr_forehead, fs, out_dir) -> None:
     ax.set_xlim(BAND_LOW_HZ * 60, BAND_HIGH_HZ * 60)
     ax.set_xlabel("częstość [BPM]")
     ax.set_ylabel("gęstość mocy [j.u.]")
-    ax.set_title("Widmo mocy (forehead) z zaznaczonym pikiem HR — subject01/s1")
+    ax.set_title(f"Widmo mocy (forehead) z zaznaczonym pikiem HR — {SUBJECT}/s1")
     ax.legend(loc="upper right")
     fig.savefig(out_dir / "spectrum_forehead.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
 def _write_table(hr, out_dir) -> None:
-    lines = ["# Estymowane HR [BPM] — subject01/s1_rest_rest (RGB-only)", "",
+    lines = [f"# Estymowane HR [BPM] — {SUBJECT}/{SCENARIO} (RGB-only)", "",
              "| region | " + " | ".join(METHODS) + " |",
              "|---|" + "---|" * len(METHODS)]
     for region in REGIONS:

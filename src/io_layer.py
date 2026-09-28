@@ -16,6 +16,7 @@ from src.config import (
     ECG_HR_MAX_BPM,
     ECG_HR_MIN_BPM,
     ECG_SKIP_SEC,
+    EVAL_SUBJECT,
     POLAR_HR_COLUMN,
     POLAR_HR_SKIP_SAMPLES,
 )
@@ -110,14 +111,23 @@ def _find_stream(session_dir: Path, suffix: str) -> Path | None:
     return None
 
 
-def list_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
-    """Nagrania z oboma strumieniami wideo (RGB + termika) w data/."""
+def list_recordings(
+    data_dir: Path = DATA_DIR,
+    subject: str | None = None,
+) -> list[Recording]:
+    """Nagrania z oboma strumieniami wideo (RGB + termika) w data/.
+
+    ``subject``: jeśli podane, tylko ta osoba (np. ``EVAL_SUBJECT`` = subject02).
+    """
     recordings: list[Recording] = []
     if not data_dir.is_dir():
         return recordings
 
+    want = _normalize_subject(subject) if subject else None
     for subject_dir in sorted(data_dir.iterdir()):
         if not subject_dir.is_dir() or not subject_dir.name.startswith("subject"):
+            continue
+        if want is not None and subject_dir.name != want:
             continue
         for session_dir in sorted(subject_dir.iterdir()):
             if not session_dir.is_dir() or not _SESSION_RE.match(session_dir.name):
@@ -129,6 +139,11 @@ def list_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
                     Recording(subject_dir.name, session_dir.name, rgb_path, thermal_path)
                 )
     return recordings
+
+
+def list_eval_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
+    """Nagrania do głównego eksperymentu: tylko ``EVAL_SUBJECT`` (subject02)."""
+    return list_recordings(data_dir, subject=EVAL_SUBJECT)
 
 
 def _normalize_subject(subject: str) -> str:
@@ -475,24 +490,13 @@ def load_reference_hr(
     subject: str,
     scenario: str,
     data_dir: Path = DATA_DIR,
-    max_median_diff_bpm: float = 20.0,
 ) -> tuple[PolarHrSeries | None, str]:
-    """Preferuje EKG (neurokit2); fallback do pliku HR.
+    """Referencja do walidacji: **wyłącznie** Polar ``*_HR.csv`` (po skip).
 
-    Jeśli EKG i plik HR się mocno rozjeżdżają (|Δ mediana| > ``max_median_diff_bpm``),
-    uznajemy detekcję R za zawodną i wracamy do pliku HR (po skip).
+    Pliki EKG są w zbiorze jako dodatek — NIE używamy ich w metrykach MAE/SNR.
     """
-    ecg = load_polar_ecg_hr(subject, scenario, data_dir)
     hr = load_polar_hr(subject, scenario, data_dir)
-
-    if ecg is not None and ecg.hr_bpm.size >= 3:
-        if hr is not None and hr.hr_bpm.size >= 3:
-            ecg_med = float(np.median(ecg.hr_bpm))
-            hr_med = float(np.median(hr.hr_bpm))
-            if abs(ecg_med - hr_med) > max_median_diff_bpm:
-                return hr, "hr_csv"
-        return ecg, "ecg"
-    if hr is not None:
+    if hr is not None and hr.hr_bpm.size >= 1:
         return hr, "hr_csv"
     return None, "none"
 

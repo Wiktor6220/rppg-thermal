@@ -271,14 +271,93 @@ def gated_means_per_window_from_samples(
     return out, fallback
 
 
+def thermal_probe_points(thermal_mask: np.ndarray, n_contour: int = 16) -> np.ndarray | None:
+    """Stałe punkty w układzie termiki: centroid + równomierna próbka konturu maski."""
+    mask_u8 = np.asarray(thermal_mask, dtype=bool).astype(np.uint8)
+    if not mask_u8.any():
+        return None
+    ys, xs = np.where(mask_u8)
+    centroid = np.array([[xs.mean(), ys.mean()]], dtype=np.float64)
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return centroid
+    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+    if cnt.shape[0] < 3:
+        return centroid
+    idx = np.linspace(0, cnt.shape[0] - 1, num=min(n_contour, cnt.shape[0]), dtype=int)
+    return np.vstack([centroid, cnt[idx]])
+
+
+def affine_point_dispersion_px(
+    matrices: list[np.ndarray],
+    probe_pts_th: np.ndarray,
+) -> dict[str, float]:
+    """Rozrzut pozycji stałych punktów termiki po zmapowaniu do RGB [px].
+
+    Returns:
+        median_abs_dev — mediana |p − med(p)| po punktach i estymatach,
+        iqr_radial — IQR odległości od mediany pozycji (po wszystkich punktach×estymatach),
+        max_median_dev — najgorszy punkt (mediana odchylenia).
+    """
+    if len(matrices) < 2 or probe_pts_th.size == 0:
+        return {"median_abs_dev": 0.0, "iqr_radial": 0.0, "max_median_dev": 0.0}
+
+    mapped = np.stack(
+        [apply_affine(np.asarray(m, dtype=np.float64), probe_pts_th) for m in matrices],
+        axis=0,
+    )  # (N, K, 2)
+    med = np.median(mapped, axis=0)  # (K, 2)
+    delta = mapped - med[None, :, :]
+    radial = np.linalg.norm(delta, axis=2)  # (N, K)
+    per_point_mad = np.median(radial, axis=0)
+    flat = radial.ravel()
+    iqr = float(np.subtract(*np.percentile(flat, [75, 25])))
+    return {
+        "median_abs_dev": float(np.median(per_point_mad)),
+        "iqr_radial": iqr,
+        "max_median_dev": float(np.max(per_point_mad)),
+    }
+
+
+def consensus_median_affine(
+    matrices: list[np.ndarray],
+    probe_pts_th: np.ndarray,
+) -> tuple[np.ndarray | None, float]:
+    """Jedna affine z mediany pozycji punktów (nie mediana 6 parametrów).
+
+    Returns:
+        (affine_2x3, mean_residual_px) albo (None, nan).
+    """
+    if not matrices or probe_pts_th is None or len(probe_pts_th) < 3:
+        return None, float("nan")
+
+    mapped = np.stack(
+        [apply_affine(np.asarray(m, dtype=np.float64), probe_pts_th) for m in matrices],
+        axis=0,
+    )
+    med_xy = np.median(mapped, axis=0)
+    resid = float(np.mean(np.linalg.norm(mapped - med_xy[None, :, :], axis=2)))
+    src = probe_pts_th.astype(np.float32)
+    dst = med_xy.astype(np.float32)
+    matrix, _ = cv2.estimateAffine2D(
+        src,
+        dst,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=1e6,
+    )
+    if matrix is None:
+        return None, resid
+    return matrix.astype(np.float64), resid
+
+
 def median_affine(matrices: list[np.ndarray]) -> np.ndarray:
-    """Mediana element-wise 6 parametrów affine 2×3."""
+    """DEPRECATED: mediana parametrów — użyj ``consensus_median_affine``."""
     stack = np.stack([np.asarray(m, dtype=np.float64) for m in matrices], axis=0)
     return np.median(stack, axis=0)
 
 
 def affine_translation_iqr_px(matrices: list[np.ndarray]) -> tuple[float, float]:
-    """IQR przesunięcia (tx, ty) w px — miara niestabilności odświeżanej affine."""
+    """DEPRECATED: IQR tx/ty — mylące przy sprzężeniu ze skalą; zostawione dla testów."""
     if len(matrices) < 2:
         return 0.0, 0.0
     txs = np.array([float(m[0, 2]) for m in matrices], dtype=np.float64)

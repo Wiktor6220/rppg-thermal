@@ -13,8 +13,8 @@ if str(ROOT) not in sys.path:
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from src.config import RESULTS_DIR  # noqa: E402
-from src.io_layer import list_recordings, load_recording  # noqa: E402
+from src.config import EVAL_SUBJECT, RESULTS_DIR  # noqa: E402
+from src.io_layer import list_eval_recordings, load_recording  # noqa: E402
 from src.roi import (  # noqa: E402
     make_cropping_detector,
     select_roi_from_landmarks,
@@ -127,8 +127,8 @@ def _process(recording) -> dict:
 
 
 def main() -> None:
-    recordings = list_recordings()
-    print(f"Nagrania do przetworzenia: {len(recordings)}")
+    recordings = list_eval_recordings()
+    print(f"Nagrania eval ({EVAL_SUBJECT}): {len(recordings)}")
     rows = []
     for rec in recordings:
         print(f"  -> {rec.subject}/{rec.scenario} ...", flush=True)

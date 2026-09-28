@@ -145,3 +145,20 @@ def test_median_affine_and_iqr():
     iqr_x, iqr_y = affine_translation_iqr_px([a, b, c])
     assert iqr_x == 10.0
     assert iqr_y == 4.0
+
+
+def test_consensus_median_affine_and_point_dispersion():
+    from src.extract import affine_point_dispersion_px, consensus_median_affine
+
+    # Trzy translacje pure: (0,0), (10,0), (20,0)
+    mats = [
+        np.array([[1.0, 0.0, float(tx)], [0.0, 1.0, 0.0]]) for tx in (0.0, 10.0, 20.0)
+    ]
+    pts = np.array([[100.0, 50.0], [200.0, 50.0], [150.0, 150.0], [120.0, 200.0]])
+    aff, resid = consensus_median_affine(mats, pts)
+    assert aff is not None
+    # Consensus ≈ tx=10
+    assert abs(aff[0, 2] - 10.0) < 1.0
+    disp = affine_point_dispersion_px(mats, pts)
+    assert disp["median_abs_dev"] > 0
+    assert disp["iqr_radial"] > 0
