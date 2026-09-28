@@ -1,7 +1,4 @@
-"""Porównanie potoku RGB (plain) vs RGB+bramkowanie termiką (gated); opcjonalnie Polar HR.
-
-Wyniki: results/pipeline_rgb_thermal/. Uruchomienie: uv run python scripts/demo_pipeline_rgb_thermal.py [--all]
-"""
+"""Porównanie plain RGB vs gated (RGB ∩ maska termiczna). Wyniki: results/pipeline_rgb_thermal/."""
 
 from __future__ import annotations
 
@@ -12,7 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-# Przed OpenCV/MediaPipe — mniej logów C++ na stderr.
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["ABSL_MIN_LOG_LEVEL"] = "3"
@@ -58,22 +54,18 @@ from src.registration import (  # noqa: E402
 from src.roi import make_cropping_detector, select_roi_from_landmarks  # noqa: E402
 
 REGIONS_EXTRACT = ["forehead", "left_cheek", "right_cheek"]
-REGIONS_REPORT = ["forehead", "cheeks"]  # L/R tylko wewnętrznie → średnia „cheeks”
+REGIONS_REPORT = ["forehead", "cheeks"]  # cheeks = średnia L+R
 METHODS = {"CHROM": methods.chrom, "POS": methods.pos}
 OUT_ROOT = RESULTS_DIR / "pipeline_rgb_thermal"
 
 
 def _affine_every(scenario: str) -> int:
-    """Interwał odświeżania affine: częściej przy ruchu / zmiennym dystansie."""
+    """Interwał odświeżania affine [klatki]."""
     return AFFINE_EVERY_BY_SCENARIO.get(scenario, AFFINE_EVERY_DEFAULT)
 
 
 def _mute_native_stderr() -> None:
-    """Wycisza logi C++ (MediaPipe/TFLite/clearcut) na fd=2; Python traceback zostaje.
-
-    Natywne biblioteki piszą wprost na deskryptor 2, omijając ``sys.stderr``.
-    Podmieniamy fd=2 na /dev/null, a ``sys.stderr`` kierujemy na kopię oryginału.
-    """
+    """Wycisza logi C++ na fd=2; traceback Pythona zostaje."""
     os.environ["GLOG_minloglevel"] = "3"
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["ABSL_MIN_LOG_LEVEL"] = "3"
@@ -133,7 +125,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _resolve_manual_gt(subject: str, scenario: str, manual_gt: str) -> Path:
-    """Zwraca ścieżkę do f*.json z klikniętymi punktami termicznymi."""
+    """Ścieżka do f*.json z punktami termicznymi GT."""
     if manual_gt.strip().lower() == "auto":
         path = (
             RESULTS_DIR
@@ -155,7 +147,7 @@ def _resolve_manual_gt(subject: str, scenario: str, manual_gt: str) -> Path:
 
 
 def _fit_affine_from_gt(landmarks: np.ndarray, gt: dict) -> np.ndarray:
-    """Affine LS termika→RGB z klikniętych punktów i landmarków na tej klatce."""
+    """Affine LS termika→RGB z punktów GT."""
     idxs = [int(i) for i in gt["landmark_idx"]]
     thermal_xy = np.asarray(gt["thermal_xy"], dtype=np.float64)
     rgb_xy = np.asarray([landmarks[i] for i in idxs], dtype=np.float64)
@@ -173,7 +165,6 @@ def _fit_affine_from_gt(landmarks: np.ndarray, gt: dict) -> np.ndarray:
         raise RuntimeError("estimateAffine2D nie zwróciło macierzy z GT.")
     resid = np.linalg.norm(apply_affine(matrix.astype(np.float64), thermal_xy) - rgb_xy, axis=1)
     rms = float(np.sqrt(np.mean(resid**2)))
-    # czoło = landmark 9, zwykle 3. punkt w CONTROL_POINTS
     forehead_i = idxs.index(9) if 9 in idxs else 2
     print(
         f"  Ręczna affine z GT: RMS={rms:.1f} px, "
@@ -190,7 +181,7 @@ def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 
 def _shrink_bbox(bbox: np.ndarray, frac: float = 0.20) -> np.ndarray:
-    """Zawęża bbox o ``frac`` od każdej krawędzi (kontrola confoundu „maska skóry")."""
+    """Zawęża bbox o ``frac`` od każdej krawędzi."""
     y0, x0, y1, x1 = (float(v) for v in bbox)
     h, w = y1 - y0, x1 - x0
     return np.array(
@@ -205,7 +196,7 @@ def _shrink_bbox(bbox: np.ndarray, frac: float = 0.20) -> np.ndarray:
 
 
 def _region_boxes(landmarks: np.ndarray) -> dict[str, np.ndarray]:
-    """Bboxy ROI do ekstrakcji: czoło + lewy/prawy policzek (bez nosa/ust)."""
+    """Bboxy forehead / left_cheek / right_cheek."""
     return {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS_EXTRACT}
 
 
@@ -229,7 +220,7 @@ def _out_dir(
     affine_mode: str = "refresh",
     mask_mode: str = "per-frame",
 ) -> Path:
-    """Katalog wyników; warianty P1 dostają osobny suffix, żeby nie nadpisać baseline."""
+    """Katalog wyników (suffix dla wariantów ≠ baseline)."""
     parts: list[str] = []
     if manual:
         parts.append("manual")
@@ -246,7 +237,7 @@ def _collect_fixed_median_affine(
     detector,
     n_target: int = AFFINE_FIXED_MEDIAN_N,
 ) -> tuple[np.ndarray | None, list[np.ndarray], dict[str, float]]:
-    """Pass 1: zbiera udane estymaty → consensus mediana pozycji punktów."""
+    """Pierwszy pass: zbiera affine → consensus mediana pozycji."""
     samples: list[np.ndarray] = []
     probe_pts: np.ndarray | None = None
     for rgb, thermal, _ in loaded.synced_pairs(reference="rgb"):
@@ -283,19 +274,14 @@ def run_one(
     affine_mode: str = "refresh",
     mask_mode: str = "per-frame",
 ) -> list[dict]:
-    """Przelicza jedno nagranie; zwraca wiersze wyników i zapisuje je lokalnie.
-
-    ``manual_gt``: stała affine z klikniętych punktów (nadpisuje ``affine_mode``).
-    ``affine_mode``: refresh | fixed-median.
-    ``mask_mode``: per-frame | per-window.
-    """
+    """Przelicza jedno nagranie i zapisuje wyniki lokalnie."""
     loaded = load_recording(subject, scenario)
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
     use_manual = manual_gt is not None
     if use_manual:
         affine_mode = "manual"
-    # s5: dystans zmienny → fixed-median fizycznie błędne
+    # s5: zmienny dystans → fixed-median nie ma sensu
     if affine_mode == "fixed-median" and scenario.startswith("s5_"):
         print(
             f"  [warn] s5 + fixed-median → wymuszam refresh "
@@ -681,7 +667,7 @@ def run_one(
 
 
 def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
-    """Zbiorcza tabela markdown + CSV dla wszystkich przebiegów."""
+    """Zbiorcza tabela markdown + CSV."""
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     suffix = f"_{tag}" if tag else ""
     csv_path = OUT_ROOT / f"summary_all{suffix}.csv"
@@ -786,7 +772,7 @@ def _write_summary(all_rows: list[dict], tag: str = "") -> Path:
                 f"{oct_s} | {len(subset)} |"
             )
 
-    # Podzbiór „baseline działa": wyłącznie na plain MAE < 15 (przed gated).
+    # Podzbiór: plain MAE < 15
     PLAIN_OK = 15.0
     lines.extend(
         [
@@ -876,7 +862,7 @@ def main() -> None:
                         mask_mode=args.mask_mode,
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 — kontynuuj pozostałe nagrania
+            except Exception as exc:  # noqa: BLE001
                 msg = f"{rec.subject}/{rec.scenario}: {exc}"
                 print(f"[FAIL] {msg}")
                 failures.append(msg)

@@ -2,48 +2,32 @@
 
 from pathlib import Path
 
-# --- Parametry sygnału ---
+# --- Sygnał ---
+FS: int = 30  # Hz (nominalnie; runtime bierze fps z metadanych)
+BAND_LOW_HZ: float = 0.7  # ~42 BPM
+BAND_HIGH_HZ: float = 4.0  # ~240 BPM
 
-FS: int = 30  # częstotliwość próbkowania klatek (Hz), wspólna dla RGB i termiki (M4T)
-
-# Pasmo HR ~42–240 bpm
-BAND_LOW_HZ: float = 0.7
-BAND_HIGH_HZ: float = 4.0
-
-# --- Detrending / filtracja / estymacja HR (estimate.py) ---
-
-# Smoothness priors (Tarvainen et al., 2002); większa lambda → silniejsze tłumienie trendu
-DETREND_LAMBDA: float = 300.0
-
+# --- Estymacja ---
+DETREND_LAMBDA: float = 300.0  # smoothness priors (Tarvainen 2002)
 BUTTERWORTH_ORDER: int = 3
-
-# Segment Welcha [s], spójny z oknem walidacji
 WELCH_SEGMENT_SEC: float = 10.0
 
-# --- Osoba / referencja w eksperymencie głównym ---
-# Tylko subject02 ma wiarygodny Polar HR; subject01 pomijamy w --all i metrykach.
+# --- Eval ---
 EVAL_SUBJECT: str = "subject02"
-# Referencja HR: wyłącznie plik Polar *_HR.csv (EKG poza ścieżką walidacji).
 REF_SOURCE: str = "hr_csv"
-
 VALIDATION_WINDOW_SEC: float = 10.0
 VALIDATION_STEP_SEC: float = 5.0
+MIN_VALID_RATIO: float = 0.5  # min. udział valid[] w oknie
 
-# Poniżej tego udziału valid[] w oknie — okno pomijane w metrykach
-MIN_VALID_RATIO: float = 0.5
+# --- Maska perfuzji ---
+PERFUSION_TEMP_STD_FACTOR: float = 0.5  # próg: mean + k*std w ROI
+PERFUSION_MIN_ROI_FRAC: float = 0.10  # poniżej → fallback do pełnego ROI
 
-# --- Maska perfuzji z termiki (extract.py) ---
-
-# Próg: mean(ROI) + k * std(ROI) na wartościach termicznych w ROI
-PERFUSION_TEMP_STD_FACTOR: float = 0.5
-# Zbyt mała maska perfuzji → fallback do pełnego ROI
-PERFUSION_MIN_ROI_FRAC: float = 0.10
-
-# --- Referencja Polar H10 (tylko HR.csv w walidacji) ---
-# Kolumna 4 (1-based) = BPM. subject02: dane dobre od startu — bez obcinania.
-POLAR_HR_COLUMN: int = 3  # 0-based
+# --- Polar HR.csv ---
+POLAR_HR_COLUMN: int = 3  # 0-based; kolumna BPM
 POLAR_HR_SKIP_SAMPLES: int = 0
-# Stałe EKG poniżej: tylko dla opcjonalnych skryptów diagnostycznych (nie walidacja).
+
+# --- Polar ECG (tylko skrypty diagnostyczne) ---
 ECG_FS_HZ: float = 130.0
 ECG_SKIP_SEC: float = 10.0
 ECG_FRAME_MARKERS: tuple[tuple[int, int, int, int], ...] = (
@@ -53,10 +37,7 @@ ECG_FRAME_MARKERS: tuple[tuple[int, int, int, int], ...] = (
 ECG_HR_MIN_BPM: float = 45.0
 ECG_HR_MAX_BPM: float = 140.0
 
-# Estymator Welch: max skok HR między oknami (ciągłość) [BPM]
-HR_MAX_JUMP_BPM: float = 25.0
-
-# --- Odświeżanie affine termika→RGB (klatki) wg scenariusza ---
+# --- Affine refresh [klatki] ---
 AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s1_rest_rest": 30,
     "s2_person_move": 30,
@@ -65,12 +46,11 @@ AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s5_approach": 5,
 }
 AFFINE_EVERY_DEFAULT: int = 30
-# Ile udanych estymat affine zebrać na początku w trybie fixed-median.
 AFFINE_FIXED_MEDIAN_N: int = 30
 
-# --- Korejestracja termika → RGB (registration.py) ---
+# --- Korejestracja ---
 REG_NOMINAL_SCALE: float = 0.52
-REG_NOMINAL_OFFSET: tuple[float, float] = (-340.0, -60.0)  # [px termiki]
+REG_NOMINAL_OFFSET: tuple[float, float] = (-340.0, -60.0)  # px termiki
 REG_WINDOW_PAD: float = 2.0
 REG_MORPH_KERNEL: int = 7
 REG_NECK_WIDTH_FRAC: float = 0.62
@@ -81,17 +61,13 @@ REG_EYE_LANDMARK_R: int = 263
 REG_GO_RMS_PX: float = 18.0
 
 # --- Ścieżki ---
-
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = ROOT_DIR / "data"
 RESULTS_DIR: Path = ROOT_DIR / "results"
 MODELS_DIR: Path = ROOT_DIR / "models"
-
-# MediaPipe FaceLandmarker (.task) — plik w models/ (poza gitem)
 FACE_LANDMARKER_MODEL_PATH: Path = MODELS_DIR / "face_landmarker.task"
 
-# --- Indeksy landmarków MediaPipe Face Mesh (468 punktów, bez iris) ---
-
+# MediaPipe Face Mesh — indeksy ROI (468 punktów)
 FACE_MESH_LANDMARK_INDICES: dict[str, list[int]] = {
     "forehead": [10, 67, 69, 66, 107, 108, 109, 151, 337, 338, 297, 299, 296, 336],
     "left_cheek": [50, 101, 118, 117, 116, 123, 147, 187, 205, 36, 142],

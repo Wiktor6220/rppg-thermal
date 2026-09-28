@@ -114,11 +114,7 @@ def generate_synthetic_frames(
     noise_std: float = 1.5,
     seed: int = 0,
 ) -> dict:
-    """Klatki RGB + termika; puls tylko w łacie wysokiej perfuzji w ROI.
-
-    Returns:
-        rgb_frames, thermal_frames, roi_mask, roi_positions, valid, patch_mask, hr_bpm, t.
-    """
+    """Klatki RGB + termika; puls tylko w łacie wysokiej perfuzji w ROI."""
     rng = np.random.default_rng(seed)
     n_frames = int(round(fs * duration_s))
     t = np.arange(n_frames) / fs

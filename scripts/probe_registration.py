@@ -21,10 +21,7 @@ from src.roi import make_cropping_detector  # noqa: E402
 
 SUBJECT, SCENARIO = "subject01", "s1_rest_rest"
 
-# Definicje punktów kontrolnych: (indeks landmarku RGB, etykieta, punkt termiczny lub None,
-# czy należy do rejonu PERFUZJI — skronie/policzki/czoło). Czubek nosa (4) i nasada nosa (168)
-# usunięte (poza płaszczyzną / nie próbkujemy). Usta = tylko anchor geometryczny (perf=False).
-# Wartości termiczne startowe — do podmiany na wynik z scripts/pick_thermal_points.py.
+# Punkty kontrolne: (indeks landmarku RGB, etykieta, xy termika, rejon perfuzji).
 POINTS = [
     (127, "skroń L (127)", (667.1, 491.6), True),
     (356, "skroń P (356)", (789.4, 491.6), True),

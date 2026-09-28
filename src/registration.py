@@ -212,10 +212,7 @@ def refine_affine_eye_y(
     thermal_mask: np.ndarray,
     landmarks: np.ndarray,
 ) -> tuple[np.ndarray, dict | None]:
-    """Koryguje ty affine, by linia oczu termiki trafiła w Y środków oczu RGB.
-
-    Zwraca (affine_po_refine, info) albo (affine_bez_zmian, None) gdy brak detekcji.
-    """
+    """Koryguje ty affine wg linii oczu termika→RGB."""
     eye_th = thermal_eye_line(gray, thermal_mask)
     if eye_th is None:
         return affine, None
@@ -237,16 +234,7 @@ def estimate_affine_thermal_to_rgb(
     thermal_frame: np.ndarray,
     landmarks: np.ndarray,
 ) -> tuple[np.ndarray | None, dict | str]:
-    """Estymuje affine termika→RGB: kontury masek + refine Y linii oczu.
-
-    Args:
-        rgb_frame: klatka RGB (H, W, 3).
-        thermal_frame: klatka termiczna (h, w) lub (h, w, 3).
-        landmarks: (K, 2) punkty MediaPipe w pikselach RGB.
-
-    Returns:
-        ``(affine_2x3, info_dict)`` albo ``(None, powód_str)``.
-    """
+    """Estymuje affine termika→RGB: kontury masek + refine Y linii oczu."""
     if landmarks is None or len(landmarks) < 3:
         return None, "brak landmarków RGB"
 

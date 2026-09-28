@@ -21,16 +21,16 @@ from src.config import (
     POLAR_HR_SKIP_SAMPLES,
 )
 
-# Konwencja nazw strumieni w folderze sesji (porównania case-insensitive).
+# Konwencja nazw w folderze sesji
 _RGB_SUFFIX = "rgb"
 _THERMAL_SUFFIX = "thermal"
 _VIDEO_EXT = ".mp4"
-_SESSION_RE = re.compile(r"^s\d+", re.IGNORECASE)  # token sesji, np. "s1" z "s1_rest_rest"
+_SESSION_RE = re.compile(r"^s\d+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class VideoMeta:
-    """Metadane pojedynczego strumienia wideo (bez wczytywania klatek do pamięci)."""
+    """Metadane strumienia wideo."""
 
     path: Path
     fps: float
@@ -40,34 +40,34 @@ class VideoMeta:
 
     @property
     def duration_s(self) -> float:
-        """Długość nagrania w sekundach (NaN, gdy fps nieznane)."""
+        """Długość [s]."""
         return self.frame_count / self.fps if self.fps > 0 else math.nan
 
     @property
     def resolution(self) -> tuple[int, int]:
-        """Rozdzielczość (szerokość, wysokość) w pikselach."""
+        """(width, height)."""
         return (self.width, self.height)
 
 
 @dataclass(frozen=True)
 class Recording:
-    """Jedno nagranie sesji: para ścieżek RGB + termika (bez wczytanych klatek)."""
+    """Para ścieżek RGB + termika jednej sesji."""
 
-    subject: str  # np. "subject01"
-    scenario: str  # pełna nazwa folderu sesji, np. "s1_rest_rest"
+    subject: str
+    scenario: str  # np. s1_rest_rest
     rgb_path: Path
     thermal_path: Path
 
     @property
     def scenario_code(self) -> str:
-        """Krótki kod sesji (token sN), np. "s1" z "s1_rest_rest"."""
+        """Kod sesji sN (np. s1 z s1_rest_rest)."""
         match = _SESSION_RE.match(self.scenario)
         return match.group(0).lower() if match else self.scenario
 
 
 @dataclass(frozen=True)
 class LoadedRecording:
-    """Nagranie z odczytanymi metadanymi obu strumieni i leniwym dostępem do klatek."""
+    """Nagranie z metadanymi i generatorami klatek."""
 
     recording: Recording
     rgb_meta: VideoMeta
@@ -98,11 +98,7 @@ class LoadedRecording:
 
 
 def _find_stream(session_dir: Path, suffix: str) -> Path | None:
-    """Znajduje w folderze sesji plik wideo o zadanym sufiksie (np. `_rgb`, `_thermal`).
-
-    Dopasowanie po sufiksie i rozszerzeniu jest case-insensitive, dzięki czemu pliki
-    Polara (.csv) i `.DS_Store` są automatycznie pomijane.
-    """
+    """Plik wideo ``*_suffix.mp4`` w folderze sesji (case-insensitive)."""
     for path in sorted(session_dir.iterdir()):
         if not path.is_file():
             continue
@@ -115,10 +111,7 @@ def list_recordings(
     data_dir: Path = DATA_DIR,
     subject: str | None = None,
 ) -> list[Recording]:
-    """Nagrania z oboma strumieniami wideo (RGB + termika) w data/.
-
-    ``subject``: jeśli podane, tylko ta osoba (np. ``EVAL_SUBJECT`` = subject02).
-    """
+    """Nagrania RGB+termika w data/; opcjonalnie filtr po subject."""
     recordings: list[Recording] = []
     if not data_dir.is_dir():
         return recordings
@@ -142,12 +135,12 @@ def list_recordings(
 
 
 def list_eval_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
-    """Nagrania do głównego eksperymentu: tylko ``EVAL_SUBJECT`` (subject02)."""
+    """Nagrania EVAL_SUBJECT (subject02)."""
     return list_recordings(data_dir, subject=EVAL_SUBJECT)
 
 
 def _normalize_subject(subject: str) -> str:
-    """Sprowadza identyfikator osoby do formy `subjectXX` (akceptuje też np. "1", "01")."""
+    """Normalizuje id osoby do subjectXX."""
     value = subject.strip()
     if value.lower().startswith("subject"):
         return value
@@ -157,19 +150,7 @@ def _normalize_subject(subject: str) -> str:
 
 
 def find_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Recording:
-    """Znajduje kompletne nagranie dla danej osoby i scenariusza.
-
-    Args:
-        subject: identyfikator osoby, np. "subject01", "01" lub "1".
-        scenario: nazwa folderu sesji ("s1_rest_rest"), kod ("s1") lub jego prefiks.
-        data_dir: katalog główny danych. Domyślnie `config.DATA_DIR`.
-
-    Returns:
-        Pasujący `Recording`.
-
-    Raises:
-        FileNotFoundError: gdy nie ma kompletnego nagrania dla (subject, scenario).
-    """
+    """Znajduje kompletne nagranie dla danej osoby i scenariusza."""
     subj = _normalize_subject(subject).lower()
     scen = scenario.strip().lower()
     for rec in list_recordings(data_dir):
@@ -184,13 +165,7 @@ def find_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Re
 
 
 def probe_video(path: Path) -> VideoMeta:
-    """Odczytuje metadane wideo (fps, liczba klatek, rozdzielczość) przez OpenCV.
-
-    Nie dekoduje klatek — czyta tylko właściwości strumienia.
-
-    Raises:
-        OSError: gdy pliku nie da się otworzyć.
-    """
+    """Odczytuje metadane wideo (fps, liczba klatek, rozdzielczość) przez OpenCV."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise OSError(f"Nie można otworzyć wideo: {path}")
@@ -208,19 +183,7 @@ def probe_video(path: Path) -> VideoMeta:
 
 
 def iter_video_frames(path: Path, to_rgb: bool = True) -> Iterator[np.ndarray]:
-    """Generator klatek wideo (H, W, 3), uint8; leniwie, po jednej klatce.
-
-    Args:
-        path: ścieżka do pliku wideo.
-        to_rgb: gdy True, konwertuje klatki z BGR (OpenCV) na RGB. Gdy False, zwraca
-            surowe klatki BGR.
-
-    Yields:
-        Kolejne klatki jako tablice (H, W, 3) uint8.
-
-    Raises:
-        OSError: gdy pliku nie da się otworzyć (przy rozpoczęciu iteracji).
-    """
+    """Generator klatek wideo (H, W, 3), uint8; leniwie, po jednej klatce."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise OSError(f"Nie można otworzyć wideo: {path}")
@@ -261,11 +224,7 @@ def iter_time_synced_pairs(
     match_resolution: str | None = None,
     to_rgb: bool = True,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
-    """Pary (rgb, thermal, t) dopasowane po czasie; reference wyznacza oś t.
-
-    Yields:
-        rgb_frame, thermal_frame, t_seconds (czas klatki reference).
-    """
+    """Pary (rgb, thermal, t) dopasowane po czasie; reference wyznacza oś t."""
     if reference not in ("rgb", "thermal"):
         raise ValueError(f"reference musi być 'rgb' albo 'thermal', otrzymano {reference!r}")
     rgb_meta, thermal_meta = loaded.rgb_meta, loaded.thermal_meta
@@ -337,10 +296,10 @@ def _resolve_target_size(
 
 @dataclass(frozen=True)
 class PolarHrSeries:
-    """Seria HR z pliku Polar ``*_HR.csv`` (czas względem pierwszej próbki po skipie)."""
+    """Seria Polar HR.csv (t_s względem startu wideo)."""
 
-    t_s: np.ndarray  # sekundy od startu serii (≈ start wideo)
-    hr_bpm: np.ndarray  # BPM
+    t_s: np.ndarray  # [s] od startu wideo
+    hr_bpm: np.ndarray
 
 
 def find_polar_hr_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:
@@ -360,12 +319,7 @@ def load_polar_hr(
     skip_samples: int = POLAR_HR_SKIP_SAMPLES,
     hr_column: int = POLAR_HR_COLUMN,
 ) -> PolarHrSeries | None:
-    """Wczytuje HR z Polara H10: kolumna BPM; opcjonalnie pomija pierwsze ``skip_samples``.
-
-    Czas ``t_s`` jest względem **pierwszego wiersza danych** (start wideo).
-    Przy ``skip_samples=0`` (domyślnie dla subject02) pierwsza próbka ma ``t_s ≈ 0``.
-    Zwraca None, gdy brak pliku.
-    """
+    """Wczytuje Polar HR.csv; t_s względem pierwszego wiersza."""
     path = find_polar_hr_path(subject, scenario, data_dir)
     if path is None:
         return None
@@ -454,11 +408,7 @@ def load_polar_ecg_hr(
     hr_min: float = ECG_HR_MIN_BPM,
     hr_max: float = ECG_HR_MAX_BPM,
 ) -> PolarHrSeries | None:
-    """HR z EKG Polara (neurokit2): odcięcie ``skip_sec``, seria (t_s, hr) od R-R.
-
-    Czas ``t_s`` jest względem początku pliku EKG (= założony start wideo).
-    Pierwsze ``skip_sec`` sekund sygnału są pomijane przed detekcją załamków R.
-    """
+    """HR z EKG Polar (neurokit2 R-R); poza ścieżką walidacji."""
     path = find_polar_ecg_path(subject, scenario, data_dir)
     if path is None:
         return None
@@ -491,10 +441,7 @@ def load_reference_hr(
     scenario: str,
     data_dir: Path = DATA_DIR,
 ) -> tuple[PolarHrSeries | None, str]:
-    """Referencja do walidacji: **wyłącznie** Polar ``*_HR.csv`` (po skip).
-
-    Pliki EKG są w zbiorze jako dodatek — NIE używamy ich w metrykach MAE/SNR.
-    """
+    """Referencja walidacyjna: Polar *_HR.csv."""
     hr = load_polar_hr(subject, scenario, data_dir)
     if hr is not None and hr.hr_bpm.size >= 1:
         return hr, "hr_csv"

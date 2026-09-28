@@ -76,7 +76,7 @@ def main() -> None:
     print(f"  {'RMS perfuzja':<11} {rms_perf:7.1f}")
     print(f"  RMS sam kontur (bez eye_y): {rms_init:.1f}")
     print(f"  próg GO:    {REG_GO_RMS_PX:.1f} px")
-    print("  odniesienie: ręczna affine ~10.5 px; stary auto ~53 px")
+    print(f"  odniesienie: ręczna affine ~10.5 px")
 
     out_dir = RESULTS_DIR / "registration_probe"
     out_dir.mkdir(parents=True, exist_ok=True)

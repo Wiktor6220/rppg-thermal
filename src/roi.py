@@ -10,19 +10,19 @@ import numpy as np
 
 from src.config import FACE_LANDMARKER_MODEL_PATH, FACE_MESH_LANDMARK_INDICES
 
-_FACE_LANDMARKER = None  # singleton MediaPipe Tasks FaceLandmarker (tworzony leniwie)
+_FACE_LANDMARKER = None  # singleton FaceLandmarker
 
 
 def _quiet_native_logs() -> None:
-    """Tłumi spam C++ z MediaPipe / TFLite / glog (INFO/WARNING/ERROR telemetry)."""
-    os.environ["GLOG_minloglevel"] = "3"  # tylko FATAL
+    """Tłumi logi C++ MediaPipe/glog."""
+    os.environ["GLOG_minloglevel"] = "3"
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 
 
 @contextmanager
 def _suppress_stderr():
-    """Przekierowuje fd=2 na /dev/null (logi natywne omijają logging Pythona)."""
+    """Tymczasowo przekierowuje stderr (fd=2) na /dev/null."""
     devnull = open(os.devnull, "w")
     stderr_fd = sys.stderr.fileno()
     saved = os.dup(stderr_fd)
@@ -41,11 +41,10 @@ def _get_face_landmarker():
     if _FACE_LANDMARKER is None:
         if not FACE_LANDMARKER_MODEL_PATH.exists():
             raise FileNotFoundError(
-                f"Brak modelu FaceLandmarker: {FACE_LANDMARKER_MODEL_PATH}. "
-                "Pobierz face_landmarker.task do models/ (patrz komentarz w config.py)."
+                f"Brak modelu FaceLandmarker: {FACE_LANDMARKER_MODEL_PATH}"
             )
         _quiet_native_logs()
-        from mediapipe.tasks import python as mp_python  # leniwy import — ciężka biblioteka
+        from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
 
         options = vision.FaceLandmarkerOptions(
@@ -53,22 +52,13 @@ def _get_face_landmarker():
             running_mode=vision.RunningMode.IMAGE,
             num_faces=1,
         )
-        # Init MediaPipe sypie I/W/E na stderr mimo GLOG_minloglevel.
         with _suppress_stderr():
             _FACE_LANDMARKER = vision.FaceLandmarker.create_from_options(options)
     return _FACE_LANDMARKER
 
 
 def detect_face_landmarks(frame: np.ndarray) -> np.ndarray | None:
-    """Wykrywa punkty charakterystyczne twarzy (FaceLandmarker) na pojedynczej klatce RGB.
-
-    Args:
-        frame: pojedyncza klatka obrazu RGB (H, W, 3), uint8 (ciągła w pamięci).
-
-    Returns:
-        Tablica (K, 2) punktów [x, y] w pikselach danej klatki (K=478 dla tego modelu;
-        indeksy ROI z config są <468), albo None, gdy twarz nie została wykryta.
-    """
+    """Wykrywa punkty charakterystyczne twarzy (FaceLandmarker) na pojedynczej klatce RGB."""
     import mediapipe as mp
 
     landmarker = _get_face_landmarker()
@@ -86,18 +76,7 @@ def detect_face_landmarks(frame: np.ndarray) -> np.ndarray | None:
 def make_facemesh_detector(
     detection_width: int = 640,
 ) -> Callable[[np.ndarray], np.ndarray | None]:
-    """Buduje detektor, który wykrywa na pomniejszonej klatce, ale zwraca punkty w oryginale.
-
-    Klatki 4K są duże — detekcja na zmniejszonej kopii (`detection_width`) jest znacznie
-    szybsza, a landmarki są przeskalowywane z powrotem do współrzędnych ORYGINAŁU, więc
-    ROI liczone jest na pełnej rozdzielczości.
-
-    Args:
-        detection_width: docelowa szerokość klatki do detekcji (0 = bez zmniejszania).
-
-    Returns:
-        Funkcja klatka -> landmarki (468, 2) w oryginalnych współrzędnych albo None.
-    """
+    """Detekcja na pomniejszonej klatce; landmarki w współrzędnych oryginału."""
 
     def detector(frame: np.ndarray) -> np.ndarray | None:
         height, width = frame.shape[:2]
@@ -109,7 +88,7 @@ def make_facemesh_detector(
                 interpolation=cv2.INTER_AREA,
             )
             points = detect_face_landmarks(small)
-            return None if points is None else points / scale  # -> współrzędne oryginału
+            return None if points is None else points / scale
         return detect_face_landmarks(frame)
 
     return detector
@@ -138,7 +117,7 @@ def make_cropping_detector(
 
             points = detect_face_landmarks(crop)
             if points is not None:
-                points_full = points + np.array([x0, y0], dtype=np.float64)  # -> oryginał
+                points_full = points + np.array([x0, y0], dtype=np.float64)
                 state["cx"] = float(points_full[:, 0].mean())
                 state["cy"] = float(points_full[:, 1].mean())
                 state["size_idx"] = k
@@ -152,22 +131,7 @@ def make_cropping_detector(
 
 
 def select_roi_from_landmarks(landmarks: np.ndarray, region: str) -> np.ndarray:
-    """Wyznacza bounding box ROI dla danego regionu na podstawie punktów charakterystycznych.
-
-    Region to jeden z kluczy `config.FACE_MESH_LANDMARK_INDICES` (np. "forehead",
-    "left_cheek", "right_cheek"). ROI zwracane jest jako bbox `[y0, x0, y1, x1]`
-    (spójnie z `extract._roi_to_mask`), obejmujący klaster punktów regionu.
-
-    Args:
-        landmarks: punkty charakterystyczne twarzy (468, 2) [x, y], wynik detekcji.
-        region: nazwa regionu ROI z `config.FACE_MESH_LANDMARK_INDICES`.
-
-    Returns:
-        Bounding box `[y0, x0, y1, x1]` (int), z dolną granicą przyciętą do 0.
-
-    Raises:
-        ValueError: gdy `region` nie występuje w konfiguracji.
-    """
+    """Bbox ROI [y0, x0, y1, x1] z landmarków regionu."""
     if region not in FACE_MESH_LANDMARK_INDICES:
         raise ValueError(
             f"Nieznany region ROI: {region!r}. Dostępne: {list(FACE_MESH_LANDMARK_INDICES)}"
@@ -208,11 +172,7 @@ def track_roi_across_frames(
     roi_builder: Callable[[np.ndarray, str], np.ndarray] = select_roi_from_landmarks,
     region: str = "forehead",
 ) -> tuple[list[np.ndarray | None], np.ndarray]:
-    """ROI per klatka; detector/roi_builder wstrzykiwalne (testy bez MediaPipe).
-
-    Returns:
-        (roi_positions, valid) — valid True tylko przy faktycznej detekcji.
-    """
+    """ROI per klatka z hold-last; valid True tylko przy detekcji."""
     raw_roi: list[np.ndarray | None] = []
     valid_list: list[bool] = []
     for frame in frames:
