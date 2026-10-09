@@ -1,5 +1,7 @@
 # Dane i artefakty lokalne (duże / niepubliczne)
 data/
+demo_data/
+demo_results/
 results/
 models/
 .venv/

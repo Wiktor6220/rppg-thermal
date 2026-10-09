@@ -109,3 +109,43 @@ def test_warp_thermal_to_rgb_shape():
     warped = warp_thermal_to_rgb(thermal, affine, (80, 100))
     assert warped.shape == (80, 100)
     assert warped.dtype == np.float64
+
+
+def test_cut_neck_pinch_removes_shoulders():
+    """Profil głowa→szyja→barki: cięcie w przewężeniu, nie poniżej najszerszego (barków)."""
+    from src.registration import _cut_neck_width_profile
+
+    h, w = 200, 120
+    comp = np.zeros((h, w), dtype=np.uint8)
+    # głowa (wiersze 20–80, szer. 40), szyja (80–100, szer. 18), barki (100–180, szer. 90)
+    for r in range(20, 80):
+        comp[r, 40:80] = 1
+    for r in range(80, 100):
+        comp[r, 51:69] = 1
+    for r in range(100, 180):
+        comp[r, 15:105] = 1
+
+    out, info = _cut_neck_width_profile(comp)
+    assert info["neck_method"] in ("pinch_shoulders", "pinch_deep", "head_frac_fallback")
+    assert info["cut_row"] is not None
+    assert 75 <= info["cut_row"] <= 105
+    assert out[50, 60] == 1  # głowa zostaje
+    assert out[150, 60] == 0  # barki odcięte
+    # najszerszy wiersz to barki — stary algorytm tnąc „poniżej widest” zostawiłby barki
+    assert int(comp.sum(axis=1).argmax()) >= 100
+
+
+def test_constrain_thermal_mask_to_rgb_face():
+    from src.registration import constrain_thermal_mask_to_rgb_face
+
+    th = np.zeros((100, 80), dtype=bool)
+    th[10:90, 10:70] = True  # duży blob
+    rgb = np.zeros((200, 160), dtype=bool)
+    rgb[40:120, 40:100] = True
+    # scale 2, offset 0: th (x,y) → rgb (2x, 2y)
+    affine = np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float64)
+    constrained = constrain_thermal_mask_to_rgb_face(th, rgb, affine)
+    assert constrained.any()
+    assert constrained.sum() < th.sum()
+    # punkt poza hull RGB (w termice nisko) powinien zniknąć
+    assert not constrained[85, 40]

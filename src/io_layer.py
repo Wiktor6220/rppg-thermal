@@ -312,18 +312,12 @@ def find_polar_hr_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -
     return unique[0] if unique else None
 
 
-def load_polar_hr(
-    subject: str,
-    scenario: str,
-    data_dir: Path = DATA_DIR,
+def load_polar_hr_csv(
+    path: Path,
     skip_samples: int = POLAR_HR_SKIP_SAMPLES,
     hr_column: int = POLAR_HR_COLUMN,
 ) -> PolarHrSeries | None:
-    """Wczytuje Polar HR.csv; t_s względem pierwszego wiersza."""
-    path = find_polar_hr_path(subject, scenario, data_dir)
-    if path is None:
-        return None
-
+    """Wczytuje Polar HR.csv z podanej ścieżki; t_s względem pierwszego wiersza."""
     import csv
     from datetime import datetime
 
@@ -351,6 +345,20 @@ def load_polar_hr(
         t_s=t_s[skip_samples:].astype(np.float64),
         hr_bpm=np.asarray(hrs[skip_samples:], dtype=np.float64),
     )
+
+
+def load_polar_hr(
+    subject: str,
+    scenario: str,
+    data_dir: Path = DATA_DIR,
+    skip_samples: int = POLAR_HR_SKIP_SAMPLES,
+    hr_column: int = POLAR_HR_COLUMN,
+) -> PolarHrSeries | None:
+    """Wczytuje Polar HR.csv; t_s względem pierwszego wiersza."""
+    path = find_polar_hr_path(subject, scenario, data_dir)
+    if path is None:
+        return None
+    return load_polar_hr_csv(path, skip_samples=skip_samples, hr_column=hr_column)
 
 
 def find_polar_ecg_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:
