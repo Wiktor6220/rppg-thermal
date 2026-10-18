@@ -27,3 +27,6 @@ notebooks/
 
 generate_results.py
 generate_tests_report.py
+
+dataold/
+metadata/

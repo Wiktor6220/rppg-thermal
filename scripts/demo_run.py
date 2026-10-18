@@ -1,7 +1,7 @@
-"""Demo end-to-end: demo_data/ (nazwy DJI) → demo_results/ bez ręcznych kroków.
+"""Demo end-to-end: demo_data/ lub data/ → demo_results/ bez ręcznych kroków.
 
-Mapuje samo: *_V.MP4→RGB, *_T.MP4→termika, dataHR_*.csv→HR (bez trimu).
-Kalibracja nominalna: demo_data/reg_calib.json (auto, jeśli brak).
+Mapuje samo: *_RGB.MP4/*_V.MP4→RGB, *_T.MP4→termika, dataHR_*.csv/*_HR.csv→HR (bez trimu).
+Kalibracja nominalna: <demo-data>/reg_calib.json (auto, jeśli brak).
 config.py / EVAL_SUBJECT / subject02 — nietknięte.
 """
 
@@ -43,7 +43,7 @@ from src.config import (  # noqa: E402
 from src.extract import (  # noqa: E402
     gated_means_per_frame_from_samples,
     mean_rgb_in_mask,
-    sample_roi_temps_via_affine,
+    sample_roi_temps_via_affine as _sample_roi_temps_via_affine,
 )
 from src.io_layer import (  # noqa: E402
     LoadedRecording,
@@ -53,6 +53,7 @@ from src.io_layer import (  # noqa: E402
 )
 from src.registration import (  # noqa: E402
     _to_gray,
+    apply_affine,
     apply_nominal_calibration,
     calibrate_nominal_registration,
     estimate_affine_thermal_to_rgb,
@@ -60,6 +61,56 @@ from src.registration import (  # noqa: E402
     rgb_face_mask,
     warp_thermal_to_rgb,
 )
+
+# OpenCV remap: dst.cols musi być < SHRT_MAX (~32k). Duże ROI (Zoom) → chunki.
+_REMAP_CHUNK = 16_384
+
+
+def sample_roi_temps_via_affine(
+    thermal_gray: np.ndarray,
+    affine_th_to_rgb: np.ndarray,
+    roi_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Jak ``src.extract.sample_roi_temps_via_affine``, ale chunkuje remap przy dużym ROI."""
+    ys, xs = np.where(np.asarray(roi_mask, dtype=bool))
+    if ys.size == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, np.zeros(0, dtype=np.float64)
+    if ys.size <= _REMAP_CHUNK:
+        return _sample_roi_temps_via_affine(thermal_gray, affine_th_to_rgb, roi_mask)
+
+    inv = cv2.invertAffineTransform(affine_th_to_rgb.astype(np.float32)).astype(np.float64)
+    pts_th = apply_affine(inv, np.column_stack([xs.astype(np.float64), ys.astype(np.float64)]))
+    th_h, th_w = thermal_gray.shape[:2]
+    inside = (
+        (pts_th[:, 0] >= 0)
+        & (pts_th[:, 0] < th_w - 1)
+        & (pts_th[:, 1] >= 0)
+        & (pts_th[:, 1] < th_h - 1)
+    )
+    if not np.any(inside):
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, np.zeros(0, dtype=np.float64)
+
+    pts_in = pts_th[inside]
+    th = np.asarray(thermal_gray, dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    for start in range(0, pts_in.shape[0], _REMAP_CHUNK):
+        chunk = pts_in[start : start + _REMAP_CHUNK]
+        map_x = chunk[:, 0].astype(np.float32).reshape(1, -1)
+        map_y = chunk[:, 1].astype(np.float32).reshape(1, -1)
+        chunks.append(
+            cv2.remap(
+                th,
+                map_x,
+                map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).ravel()
+        )
+    temps = np.concatenate(chunks).astype(np.float64)
+    return ys[inside], xs[inside], temps
 from src.roi import make_cropping_detector, select_roi_from_landmarks  # noqa: E402
 
 DEMO_DATA = ROOT / "demo_data"
@@ -95,10 +146,13 @@ def discover_demo_sessions(demo_data: Path = DEMO_DATA) -> list[tuple[str, str, 
 
 
 def resolve_dji_streams(session_dir: Path) -> tuple[Path, Path, Path]:
-    """*_V.MP4 → RGB, *_T.MP4 → termika, dataHR_*.csv → HR (preferuj surowy dataHR)."""
+    """*_RGB.MP4/*_V.MP4 → RGB, *_T.MP4 → termika, dataHR_*.csv/*_HR.csv → HR."""
     rgb = _pick_one(
-        list(session_dir.glob("*_V.MP4")) + list(session_dir.glob("*_V.mp4")),
-        "RGB (*_V.MP4)",
+        list(session_dir.glob("*_RGB.MP4"))
+        + list(session_dir.glob("*_RGB.mp4"))
+        + list(session_dir.glob("*_V.MP4"))
+        + list(session_dir.glob("*_V.mp4")),
+        "RGB (*_RGB.MP4/*_V.MP4)",
         session_dir,
     )
     thermal = _pick_one(
@@ -109,7 +163,7 @@ def resolve_dji_streams(session_dir: Path) -> tuple[Path, Path, Path]:
     hr_candidates = sorted(session_dir.glob("dataHR_*.csv"))
     if not hr_candidates:
         hr_candidates = sorted(session_dir.glob("*_HR.csv"))
-    hr = _pick_one(hr_candidates, "HR (dataHR_*.csv)", session_dir)
+    hr = _pick_one(hr_candidates, "HR (dataHR_*.csv/*_HR.csv)", session_dir)
     return rgb, thermal, hr
 
 
