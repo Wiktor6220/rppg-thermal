@@ -42,11 +42,27 @@ def bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
     return sosfiltfilt(sos, signal)
 
 
-def estimate_hr_welch(signal: np.ndarray, fs: float) -> float:
-    """HR = argmax PSD Welcha w paśmie; nfft ≥ 2048."""
+def estimate_hr_welch(
+    signal: np.ndarray,
+    fs: float,
+    *,
+    segment_sec: float | None = None,
+    overlap: float = 0.5,
+) -> float:
+    """HR = argmax PSD Welcha w paśmie; nfft ≥ 2048.
+
+    ``segment_sec=None`` → ``WELCH_SEGMENT_SEC`` z config (często ≈ długość okna
+    walidacji → mało uśredniania). Krótszy ``segment_sec`` + overlap zmniejsza
+    wariancję PSD (opcjonalne A/B).
+    """
     signal = np.asarray(signal, dtype=np.float64)
-    nperseg = min(len(signal), int(round(WELCH_SEGMENT_SEC * fs)))
-    freqs, psd = welch(signal, fs=fs, nperseg=nperseg, nfft=max(nperseg, 2048))
+    seg_s = float(WELCH_SEGMENT_SEC if segment_sec is None else segment_sec)
+    nperseg = max(8, min(len(signal), int(round(seg_s * fs))))
+    noverlap = int(round(nperseg * float(overlap)))
+    noverlap = min(max(0, noverlap), nperseg - 1)
+    freqs, psd = welch(
+        signal, fs=fs, nperseg=nperseg, noverlap=noverlap, nfft=max(nperseg, 2048)
+    )
     band = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)
     if not np.any(band):
         raise ValueError("Brak składowych widma w paśmie HR.")

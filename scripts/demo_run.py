@@ -8,6 +8,7 @@ config.py / EVAL_SUBJECT / subject02 — nietknięte.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -36,9 +37,11 @@ from src.config import (  # noqa: E402
     AFFINE_EVERY_DEFAULT,
     BAND_HIGH_HZ,
     BAND_LOW_HZ,
+    HEADLINE_REGION,
+    PEAK_SNR_CONF_HIGH_DB,
+    PEAK_SNR_CONF_MED_DB,
     POLAR_HR_SKIP_SAMPLES,
     REG_GO_RMS_PX,
-    VALIDATION_WINDOW_SEC,
 )
 from src.extract import (  # noqa: E402
     gated_means_per_frame_from_samples,
@@ -48,8 +51,13 @@ from src.extract import (  # noqa: E402
 from src.io_layer import (  # noqa: E402
     LoadedRecording,
     Recording,
+    hr_video_time_overlap_ok,
     load_polar_hr_csv,
     probe_video,
+)
+from src.quality_roi import (  # noqa: E402
+    peak_snr_db,
+    skin_fraction_in_mask,
 )
 from src.registration import (  # noqa: E402
     _to_gray,
@@ -60,6 +68,11 @@ from src.registration import (  # noqa: E402
     registration_quality,
     rgb_face_mask,
     warp_thermal_to_rgb,
+)
+from src.roi import (  # noqa: E402
+    make_cropping_detector,
+    roi_mask_from_landmarks,
+    select_roi_from_landmarks,
 )
 
 # OpenCV remap: dst.cols musi być < SHRT_MAX (~32k). Duże ROI (Zoom) → chunki.
@@ -111,7 +124,6 @@ def sample_roi_temps_via_affine(
         )
     temps = np.concatenate(chunks).astype(np.float64)
     return ys[inside], xs[inside], temps
-from src.roi import make_cropping_detector, select_roi_from_landmarks  # noqa: E402
 
 DEMO_DATA = ROOT / "demo_data"
 DEMO_RESULTS = ROOT / "demo_results"
@@ -119,8 +131,54 @@ CALIB_PATH = DEMO_DATA / "reg_calib.json"
 
 REGIONS_EXTRACT = ["forehead", "left_cheek", "right_cheek"]
 REGIONS_REPORT = ["forehead", "cheeks"]
-METHODS = {"CHROM": methods.chrom, "POS": methods.pos}
 FIG_DPI = 160
+
+
+def _chrom_fn(*, window_bandpass: bool):
+    """CHROM legacy (bandpass per-okno) albo fixed (bez BP + Hanning OLA)."""
+    if window_bandpass:
+        return lambda rgb, fs: methods.chrom(rgb, fs, window_bandpass=True, hann_ola=False)
+    return lambda rgb, fs: methods.chrom(rgb, fs, window_bandpass=False, hann_ola=True)
+
+
+def _method_fns(*, chrom_window_bandpass: bool) -> dict:
+    """POS = główny pipeline; CHROM = porównawczy (domyślnie legacy)."""
+    return {
+        "POS": methods.pos,
+        "CHROM": _chrom_fn(window_bandpass=chrom_window_bandpass),
+    }
+
+
+def _variant_name(roi_mask_mode: str, chrom_window_bandpass: bool) -> str:
+    chrom_tag = "chrom_legacy" if chrom_window_bandpass else "chrom_fixed"
+    return f"{roi_mask_mode}_{chrom_tag}"
+
+
+@contextlib.contextmanager
+def _redirect_stderr_to(log_path: Path):
+    """Przekierowuje fd=2 (stderr) do pliku na cały blok; stdout (pasek postępu) zostaje.
+
+    MediaPipe telemetria (portable_clearcut_uploader) leci z wątku w tle na fd=2
+    poza jednorazowym create FaceLandmarker — stąd zakres sesji, nie /dev/null.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_fd = sys.stderr.fileno()
+    saved_fd = os.dup(stderr_fd)
+    log_f = open(log_path, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+    try:
+        os.dup2(log_f.fileno(), stderr_fd)
+        yield log_path
+    except Exception:
+        os.dup2(saved_fd, stderr_fd)
+        print(f"[error] Native/MediaPipe stderr → {log_path}", flush=True)
+        raise
+    finally:
+        try:
+            os.dup2(saved_fd, stderr_fd)
+        except OSError:
+            pass
+        os.close(saved_fd)
+        log_f.close()
 
 
 # ---------------------------------------------------------------------------
@@ -188,37 +246,130 @@ def load_demo_recording(session_dir: Path, subject: str, scenario: str) -> tuple
 # ---------------------------------------------------------------------------
 
 
+def _try_calibrate_from_session(
+    session_dir: Path,
+    subject: str,
+    scenario: str,
+    max_frames: int = 90,
+) -> dict | None:
+    """Kalibracja z pierwszej klatki z twarzą w sesji; None gdy brak detekcji."""
+    loaded, _ = load_demo_recording(session_dir, subject, scenario)
+    detector = make_cropping_detector()
+    for i, (rgb, thermal, _) in enumerate(loaded.synced_pairs(reference="rgb")):
+        if i >= max_frames:
+            break
+        lm = detector(rgb)
+        if lm is None:
+            continue
+        calib = calibrate_nominal_registration(rgb, thermal, lm)
+        calib["source"] = f"{subject}/{scenario}#frame{i}"
+        return calib
+    return None
+
+
+def _best_sibling_calib(subject: str, exclude_scenario: str) -> tuple[dict, str] | None:
+    """Fallback: scena tego badanego z najniższym RMS w reg_quality.json."""
+    subj_root = DEMO_RESULTS / subject
+    if not subj_root.is_dir():
+        return None
+    best: tuple[float, Path, str] | None = None
+    for scen_dir in sorted(p for p in subj_root.iterdir() if p.is_dir()):
+        if scen_dir.name == exclude_scenario:
+            continue
+        qpath = scen_dir / "reg_quality.json"
+        cpath = scen_dir / "reg_calib.json"
+        if not (qpath.is_file() and cpath.is_file()):
+            continue
+        try:
+            q = json.loads(qpath.read_text(encoding="utf-8"))
+            rms = float(q.get("contour_rms_px", float("inf")))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if best is None or rms < best[0]:
+            best = (rms, cpath, scen_dir.name)
+    if best is None:
+        return None
+    calib = json.loads(best[1].read_text(encoding="utf-8"))
+    return calib, f"fallback:{best[2]}"
+
+
+def ensure_scene_calibration(
+    demo_data: Path,
+    subject: str,
+    scenario: str,
+    session_dir: Path,
+    force: bool = False,
+) -> tuple[dict, str]:
+    """Kalibracja **per scena** → ``demo_results/<subject>/<scena>/reg_calib.json``.
+
+    Zwraca ``(calib, reg_calib_source)`` gdzie source ∈
+    ``self`` | ``fallback:<scena>`` | ``fallback:subject`` | ``fallback:shared``.
+    """
+    out_calib = DEMO_RESULTS / subject / scenario / "reg_calib.json"
+    if out_calib.is_file() and not force:
+        calib = json.loads(out_calib.read_text(encoding="utf-8"))
+        apply_nominal_calibration(calib)
+        src = str(calib.get("calib_source_tag", "self"))
+        print(f"Kalibracja {subject}/{scenario} z {out_calib} ({src})")
+        return calib, src
+
+    calib = _try_calibrate_from_session(session_dir, subject, scenario)
+    source_tag = "self"
+    if calib is None:
+        sib = _best_sibling_calib(subject, exclude_scenario=scenario)
+        if sib is not None:
+            calib, source_tag = sib
+        else:
+            subj_calib = DEMO_RESULTS / subject / "reg_calib.json"
+            shared = demo_data / "reg_calib.json"
+            if subj_calib.is_file():
+                calib = json.loads(subj_calib.read_text(encoding="utf-8"))
+                source_tag = "fallback:subject"
+            elif shared.is_file():
+                calib = json.loads(shared.read_text(encoding="utf-8"))
+                source_tag = "fallback:shared"
+            else:
+                raise RuntimeError(
+                    f"Kalibracja {subject}/{scenario}: brak twarzy i brak fallbacku"
+                )
+
+    calib = dict(calib)
+    calib["calib_source_tag"] = source_tag
+    out_calib.parent.mkdir(parents=True, exist_ok=True)
+    out_calib.write_text(json.dumps(calib, indent=2), encoding="utf-8")
+    apply_nominal_calibration(calib)
+    print(
+        f"Zapisano kalibrację {subject}/{scenario} → {out_calib} [{source_tag}]\n"
+        f"  źródło={calib.get('source')} scale={calib.get('REG_NOMINAL_SCALE')}"
+    )
+    return calib, source_tag
+
+
+def ensure_subject_calibration(
+    demo_data: Path,
+    subject: str,
+    force: bool = False,
+) -> dict:
+    """Kompatybilność: kalibracja z pierwszej sceny badanego (preferuj ensure_scene_*)."""
+    sessions = [s for s in discover_demo_sessions(demo_data) if s[0] == subject]
+    if not sessions:
+        raise FileNotFoundError(f"Brak sesji dla {subject}")
+    _, scenario, session_dir = sessions[0]
+    calib, _ = ensure_scene_calibration(
+        demo_data, subject, scenario, session_dir, force=force
+    )
+    return calib
+
+
 def ensure_calibration(
     demo_data: Path = DEMO_DATA,
     force: bool = False,
 ) -> dict:
-    """Ładuje reg_calib.json albo liczy z pierwszego nagrania i zapisuje."""
-    if CALIB_PATH.is_file() and not force:
-        calib = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
-        apply_nominal_calibration(calib)
-        print(f"Kalibracja z {CALIB_PATH}")
-        return calib
-
+    """Kompatybilność wstecz."""
     sessions = discover_demo_sessions(demo_data)
     if not sessions:
         raise FileNotFoundError(f"Brak sesji w {demo_data}")
-    subject, scenario, session_dir = sessions[0]
-    loaded, _ = load_demo_recording(session_dir, subject, scenario)
-    rgb, thermal, _ = next(loaded.synced_pairs(reference="rgb"))
-    lm = make_cropping_detector()(rgb)
-    if lm is None:
-        raise RuntimeError(f"Kalibracja: brak twarzy w {subject}/{scenario}")
-    calib = calibrate_nominal_registration(rgb, thermal, lm)
-    calib["source"] = f"{subject}/{scenario}"
-    CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CALIB_PATH.write_text(json.dumps(calib, indent=2), encoding="utf-8")
-    apply_nominal_calibration(calib)
-    print(
-        f"Zapisano kalibrację → {CALIB_PATH}\n"
-        f"  scale={calib['REG_NOMINAL_SCALE']:.4f} "
-        f"offset={calib['REG_NOMINAL_OFFSET']} pad={calib['REG_WINDOW_PAD']}"
-    )
-    return calib
+    return ensure_subject_calibration(demo_data, sessions[0][0], force=force)
 
 
 # ---------------------------------------------------------------------------
@@ -226,280 +377,592 @@ def ensure_calibration(
 # ---------------------------------------------------------------------------
 
 
-def _bbox_to_mask(bbox: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    y0, x0, y1, x1 = (int(v) for v in bbox)
-    mask = np.zeros(shape, dtype=bool)
-    mask[y0:y1, x0:x1] = True
-    return mask
-
-
-def _region_boxes(landmarks: np.ndarray) -> dict[str, np.ndarray]:
-    return {r: select_roi_from_landmarks(landmarks, r) for r in REGIONS_EXTRACT}
-
-
 def run_session(
     subject: str,
     scenario: str,
     session_dir: Path,
     out_dir: Path,
+    *,
+    roi_mask_mode: str = "bbox",
+    chrom_window_bandpass: bool | None = True,
+    ab_sweep: bool = False,
+    reg_calib_source: str = "self",
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stderr_log = out_dir / "run_stderr.log"
+    with _redirect_stderr_to(stderr_log):
+        return _run_session_body(
+            subject,
+            scenario,
+            session_dir,
+            out_dir,
+            stderr_log,
+            roi_mask_mode=roi_mask_mode,
+            chrom_window_bandpass=chrom_window_bandpass,
+            ab_sweep=ab_sweep,
+            reg_calib_source=reg_calib_source,
+        )
+
+
+def _run_session_body(
+    subject: str,
+    scenario: str,
+    session_dir: Path,
+    out_dir: Path,
+    stderr_log: Path,
+    *,
+    roi_mask_mode: str = "bbox",
+    chrom_window_bandpass: bool | None = True,
+    ab_sweep: bool = False,
+    reg_calib_source: str = "self",
 ) -> dict:
     loaded, hr_path = load_demo_recording(session_dir, subject, scenario)
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
-    polar = load_polar_hr_csv(hr_path, skip_samples=POLAR_HR_SKIP_SAMPLES)
+    duration_s = float(loaded.rgb_meta.duration_s)
+    rgb_path = loaded.recording.rgb_path
+    polar = load_polar_hr_csv(
+        hr_path,
+        skip_samples=POLAR_HR_SKIP_SAMPLES,
+        video_path=rgb_path,
+        video_duration_s=duration_s,
+    )
     if polar is None:
         raise RuntimeError(f"Nie udało się wczytać HR: {hr_path}")
 
+    ok_overlap, overlap_msg = hr_video_time_overlap_ok(polar, duration_s)
+    if (not ok_overlap) or ("SANITY_FAIL" in (polar.sync_note or "")):
+        msg = overlap_msg if not ok_overlap else polar.sync_note
+        print(
+            f"\n{'=' * 60}\n"
+            f"[SKIP] {subject}/{scenario}: brak sensownego pokrycia HR↔wideo — {msg}",
+            flush=True,
+        )
+        return {"rows": [], "quality": None, "gated_status": "SKIP", "skipped": True}
+
     print(f"\n{'=' * 60}")
-    print(f"{subject}/{scenario}  {n_frames} kl. @ {fs:.3f} fps  HR={hr_path.name} (n={len(polar.hr_bpm)})")
-
-    detector = make_cropping_detector()
-    affine_every = AFFINE_EVERY_DEFAULT
-    affine = None
-    last_boxes = None
-    pending: list[tuple[np.ndarray, np.ndarray]] = []
-    n_affine_ok = n_affine_fail = 0
-
-    plain_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
-    rgb_pix: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
-    temps_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
-    valid_list: list[bool] = []
-
-    # Pierwsza udana detekcja+affine → figury i quality (nie sztywno i==0).
-    frame0_rgb = frame0_th = frame0_lm = None
-    reg_info0 = None
-    quality = None
-    quality_frame_idx: int | None = None
-
-    def _append(rgb, thermal, boxes, detected: bool) -> None:
-        nonlocal affine, n_affine_ok, n_affine_fail
-        valid_list.append(detected)
-        h, w = rgb.shape[:2]
-        th_gray = _to_gray(thermal).astype(np.float32)
-        for region in REGIONS_EXTRACT:
-            roi_mask = _bbox_to_mask(boxes[region], (h, w))
-            plain_lists[region].append(mean_rgb_in_mask(rgb, roi_mask))
-            if affine is None:
-                rgb_pix[region].append(None)
-                temps_lists[region].append(None)
-                continue
-            ys, xs, tvals = sample_roi_temps_via_affine(th_gray, affine, roi_mask)
-            if tvals.size == 0:
-                rgb_pix[region].append(None)
-                temps_lists[region].append(None)
-            else:
-                rgb_pix[region].append(rgb[ys, xs].astype(np.float64))
-                temps_lists[region].append(tvals)
-
-    print("Przebieg synced RGB+termika...", flush=True)
-    for i, (rgb, thermal, _) in enumerate(loaded.synced_pairs(reference="rgb")):
-        landmarks = detector(rgb)
-        if landmarks is not None:
-            boxes = _region_boxes(landmarks)
-            if affine is None or (i % affine_every == 0):
-                new_aff, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
-                if new_aff is not None:
-                    affine = new_aff.astype(np.float64)
-                    n_affine_ok += 1
-                    if quality is None:
-                        frame0_rgb, frame0_th, frame0_lm = rgb.copy(), thermal.copy(), landmarks
-                        reg_info0 = info
-                        quality = registration_quality(
-                            affine, info["thermal_mask"], info["rgb_mask"]
-                        )
-                        quality_frame_idx = i
-                        if i > 0:
-                            print(
-                                f"  [info] pierwsza udana rejestracja na klatce {i} "
-                                f"(wcześniejsze bez twarzy/affine)",
-                                flush=True,
-                            )
-                else:
-                    n_affine_fail += 1
-                    if quality is None:
-                        print(f"  [warn] affine (klatka {i}): {info}")
-            if last_boxes is None and pending:
-                for pr, pt in pending:
-                    _append(pr, pt, boxes, False)
-                pending.clear()
-            last_boxes = boxes
-            _append(rgb, thermal, boxes, True)
-        else:
-            if last_boxes is None:
-                pending.append((rgb, thermal))
-            else:
-                _append(rgb, thermal, last_boxes, False)
-        if (i + 1) % 200 == 0 or i + 1 == n_frames:
-            print(f"  klatka {i + 1}/{n_frames}", flush=True)
-
-    if quality is None:
-        raise RuntimeError(
-            f"{subject}/{scenario}: brak udanej detekcji twarzy + affine "
-            f"w całym nagraniu (affine OK/fail={n_affine_ok}/{n_affine_fail}) — "
-            f"nie można policzyć quality/figur."
-        )
-
-    valid = np.array(valid_list, dtype=bool)
-    plain_ex = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
-    gated_ex: dict[str, np.ndarray] = {}
-    fallback_flags: dict[str, np.ndarray] = {}
-    for region in REGIONS_EXTRACT:
-        g, fb = gated_means_per_frame_from_samples(
-            rgb_pix[region], temps_lists[region], plain_ex[region]
-        )
-        gated_ex[region] = g
-        fallback_flags[region] = fb
-
-    plain = {
-        "forehead": plain_ex["forehead"],
-        "cheeks": 0.5 * (plain_ex["left_cheek"] + plain_ex["right_cheek"]),
-    }
-    gated = {
-        "forehead": gated_ex["forehead"],
-        "cheeks": 0.5 * (gated_ex["left_cheek"] + gated_ex["right_cheek"]),
-    }
-    fb_fore = 100.0 * float(fallback_flags["forehead"].mean())
-    fb_cheek = 100.0 * float(
-        0.5
-        * (fallback_flags["left_cheek"].astype(float) + fallback_flags["right_cheek"].astype(float)).mean()
-    )
-
-    hr_ref = float(np.median(polar.hr_bpm))
-    rows: list[dict] = []
-    cleaned: dict[tuple[str, str, str], np.ndarray] = {}
-    window_hrs: dict[tuple[str, str, str], tuple[np.ndarray, np.ndarray]] = {}
-
-    trustworthy = bool(quality and quality["trustworthy"])
-    gate_label = "trustworthy" if trustworthy else "NO-GO"
-
+    offset_s = float(polar.sync_offset_s)
+    offset_str = f"{offset_s:.3f} s" if np.isfinite(offset_s) else "n/a"
     print(
-        f"Rejestracja: RMS={quality['contour_rms_px']:.1f} px  "
-        f"IoU={quality['iou']:.3f}  → gated {gate_label}  "
-        f"(próg {REG_GO_RMS_PX:.0f} px); affine OK/fail={n_affine_ok}/{n_affine_fail}"
-        f"; quality@klatka={quality_frame_idx}"
+        f"{subject}/{scenario}  {n_frames} kl. @ {fs:.3f} fps  HR={hr_path.name} "
+        f"(n={len(polar.hr_bpm)})  sync={polar.sync_mode}  "
+        f"offset(start_wideo−start_HR)={offset_str}"
+    )
+    if polar.sync_note:
+        print(f"  {polar.sync_note}")
+    print(f"  native stderr → {stderr_log}")
+
+    # Mediana HR tylko w oknie wideo [0, duration] (nie całe nagranie Polara).
+    in_vid = (polar.t_s >= 0.0) & (polar.t_s < duration_s)
+    hr_ref = (
+        float(np.median(polar.hr_bpm[in_vid]))
+        if np.any(in_vid)
+        else float(np.median(polar.hr_bpm))
     )
 
-    for region in REGIONS_REPORT:
-        for name, fn in METHODS.items():
-            sig_p = fn(plain[region], fs)
-            sig_g = fn(gated[region], fs)
-            clean_p = estimate.bandpass_filter(estimate.detrend_signal(sig_p), fs)
-            clean_g = estimate.bandpass_filter(estimate.detrend_signal(sig_g), fs)
-            hr_p = estimate.estimate_hr_welch(clean_p, fs)
-            hr_g = estimate.estimate_hr_welch(clean_g, fs)
-            vp = validate.validate_against_hr_series(
-                sig_p, fs, polar.t_s, polar.hr_bpm, valid=valid
-            )
-            vg = validate.validate_against_hr_series(
-                sig_g, fs, polar.t_s, polar.hr_bpm, valid=valid
-            )
-            fb = fb_fore if region == "forehead" else fb_cheek
-            row = {
-                "subject": subject,
-                "scenario": scenario,
-                "region": region,
-                "method": name,
-                "hr_ref": hr_ref,
-                "hr_plain": float(hr_p),
-                "hr_gated": float(hr_g),
-                "snr_plain": float(vp["snr_mean"]),
-                "snr_gated": float(vg["snr_mean"]),
-                "delta_snr": float(vg["snr_mean"] - vp["snr_mean"]),
-                "mae_plain": float(vp["mae_bpm"]),
-                "mae_gated": float(vg["mae_bpm"]),
-                "rmse_plain": float(vp["rmse_bpm"]),
-                "rmse_gated": float(vg["rmse_bpm"]),
-                "octave_frac_plain": float(vp["octave_error_frac"]),
-                "octave_frac_gated": float(vg["octave_error_frac"]),
-                "fallback_pct": float(fb),
-                "n_windows": int(vp["n_windows_used"]),
-                "reg_rms_px": float(quality["contour_rms_px"]),
-                "reg_iou": float(quality["iou"]),
-                "gated_status": gate_label,
-            }
-            rows.append(row)
-            cleaned[(region, name, "plain")] = clean_p
-            cleaned[(region, name, "gated")] = clean_g
-            # HR per okno 10 s
-            win = max(1, int(round(VALIDATION_WINDOW_SEC * fs)))
-            step = max(1, win // 2)
-            t_centers = []
-            hr_series_p = []
-            hr_series_g = []
-            for start in range(0, len(clean_p) - win + 1, step):
-                sl = slice(start, start + win)
-                if valid[sl].mean() < 0.5:
+    def _extract_traces(mask_mode: str) -> dict:
+        """Jeden przebieg dekodowania: plain/gated RGB + quality (ROI bbox|hull)."""
+        detector = make_cropping_detector()
+        affine_every = AFFINE_EVERY_DEFAULT
+        affine = None
+        # Hold-last landmarków: klatki bez detekcji mają valid=False (nie wliczane
+        # do progu 50% okna), ale próbka RGB z zamrożonego ROI nadal wchodzi w sygnał.
+        last_lm = None
+        pending: list[tuple[np.ndarray, np.ndarray]] = []
+        n_affine_ok = n_affine_fail = 0
+        plain_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+        rgb_pix: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+        temps_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+        skin_lists: dict[str, list] = {r: [] for r in REGIONS_EXTRACT}
+        valid_list: list[bool] = []
+        frame0_rgb = frame0_th = frame0_lm = None
+        reg_info0 = None
+        quality = None
+        quality_frame_idx: int | None = None
+
+        def _append(rgb, thermal, landmarks, detected: bool) -> None:
+            nonlocal affine
+            valid_list.append(detected)
+            h, w = rgb.shape[:2]
+            th_gray = _to_gray(thermal).astype(np.float32)
+            for region in REGIONS_EXTRACT:
+                roi_mask = roi_mask_from_landmarks(
+                    landmarks, region, (h, w), mode=mask_mode
+                )
+                plain_lists[region].append(mean_rgb_in_mask(rgb, roi_mask))
+                if detected:
+                    skin_lists[region].append(skin_fraction_in_mask(rgb, roi_mask))
+                if affine is None:
+                    rgb_pix[region].append(None)
+                    temps_lists[region].append(None)
                     continue
-                t_centers.append((start + win / 2) / fs)
-                try:
-                    hr_series_p.append(estimate.estimate_hr_welch(clean_p[sl], fs))
-                    hr_series_g.append(estimate.estimate_hr_welch(clean_g[sl], fs))
-                except Exception:  # noqa: BLE001
-                    hr_series_p.append(float("nan"))
-                    hr_series_g.append(float("nan"))
-            window_hrs[(region, name, "plain")] = (
-                np.asarray(t_centers),
-                np.asarray(hr_series_p),
-            )
-            window_hrs[(region, name, "gated")] = (
-                np.asarray(t_centers),
-                np.asarray(hr_series_g),
+                ys, xs, tvals = sample_roi_temps_via_affine(th_gray, affine, roi_mask)
+                if tvals.size == 0:
+                    rgb_pix[region].append(None)
+                    temps_lists[region].append(None)
+                else:
+                    rgb_pix[region].append(rgb[ys, xs].astype(np.float64))
+                    temps_lists[region].append(tvals)
+
+        print(
+            f"Przebieg synced RGB+termika (roi={mask_mode})...",
+            flush=True,
+        )
+        for i, (rgb, thermal, _) in enumerate(loaded.synced_pairs(reference="rgb")):
+            landmarks = detector(rgb)
+            if landmarks is not None:
+                if affine is None or (i % affine_every == 0):
+                    new_aff, info = estimate_affine_thermal_to_rgb(
+                        rgb, thermal, landmarks
+                    )
+                    if new_aff is not None:
+                        affine = new_aff.astype(np.float64)
+                        n_affine_ok += 1
+                        if quality is None:
+                            frame0_rgb = rgb.copy()
+                            frame0_th = thermal.copy()
+                            frame0_lm = landmarks
+                            reg_info0 = info
+                            quality = registration_quality(
+                                affine, info["thermal_mask"], info["rgb_mask"]
+                            )
+                            quality_frame_idx = i
+                            if i > 0:
+                                print(
+                                    f"  [info] pierwsza udana rejestracja na klatce {i}",
+                                    flush=True,
+                                )
+                    else:
+                        n_affine_fail += 1
+                        if quality is None:
+                            print(f"  [warn] affine (klatka {i}): {info}")
+                if last_lm is None and pending:
+                    for pr, pt in pending:
+                        _append(pr, pt, landmarks, False)
+                    pending.clear()
+                last_lm = landmarks
+                _append(rgb, thermal, landmarks, True)
+            else:
+                if last_lm is None:
+                    pending.append((rgb, thermal))
+                else:
+                    _append(rgb, thermal, last_lm, False)
+            if (i + 1) % 200 == 0 or i + 1 == n_frames:
+                print(f"  klatka {i + 1}/{n_frames}", flush=True)
+
+        if quality is None:
+            raise RuntimeError(
+                f"{subject}/{scenario}: brak twarzy+affine "
+                f"(OK/fail={n_affine_ok}/{n_affine_fail})"
             )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    _write_tables(out_dir, rows, quality, gate_label)
-    if frame0_rgb is not None and reg_info0 is not None and affine is not None:
-        _save_figures(
-            out_dir,
-            frame0_rgb,
-            frame0_th,
-            frame0_lm,
-            reg_info0,
-            affine,
-            quality,
-            cleaned,
-            window_hrs,
-            polar,
-            fs,
-            rows,
+        valid = np.array(valid_list, dtype=bool)
+        plain_ex = {r: np.asarray(v, dtype=np.float64) for r, v in plain_lists.items()}
+        gated_ex: dict[str, np.ndarray] = {}
+        fallback_flags: dict[str, np.ndarray] = {}
+        for region in REGIONS_EXTRACT:
+            g, fb = gated_means_per_frame_from_samples(
+                rgb_pix[region], temps_lists[region], plain_ex[region]
+            )
+            gated_ex[region] = g
+            fallback_flags[region] = fb
+        plain = {
+            "forehead": plain_ex["forehead"],
+            "cheeks": 0.5 * (plain_ex["left_cheek"] + plain_ex["right_cheek"]),
+        }
+        gated = {
+            "forehead": gated_ex["forehead"],
+            "cheeks": 0.5 * (gated_ex["left_cheek"] + gated_ex["right_cheek"]),
+        }
+        fb_fore = 100.0 * float(fallback_flags["forehead"].mean())
+        fb_cheek = 100.0 * float(
+            0.5
+            * (
+                fallback_flags["left_cheek"].astype(float)
+                + fallback_flags["right_cheek"].astype(float)
+            ).mean()
         )
 
-    (out_dir / "reg_quality.json").write_text(
-        json.dumps(
-            {
-                **quality,
-                "method": reg_info0["method"] if reg_info0 else None,
-                "gated_status": gate_label,
-                "affine_ok": n_affine_ok,
-                "affine_fail": n_affine_fail,
-                "valid_pct": float(100.0 * valid.mean()),
-                "quality_frame_idx": quality_frame_idx,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+        def _mean_skin(key: str) -> float:
+            vals = [v for v in skin_lists[key] if np.isfinite(v)]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        skin_fore = _mean_skin("forehead")
+        skin_l, skin_r = _mean_skin("left_cheek"), _mean_skin("right_cheek")
+        cheek_vals = [v for v in (skin_l, skin_r) if np.isfinite(v)]
+        skin_cheeks = float(np.mean(cheek_vals)) if cheek_vals else float("nan")
+        return {
+            "plain": plain,
+            "gated": gated,
+            "valid": valid,
+            "quality": quality,
+            "reg_info0": reg_info0,
+            "affine": affine,
+            "frame0_rgb": frame0_rgb,
+            "frame0_th": frame0_th,
+            "frame0_lm": frame0_lm,
+            "quality_frame_idx": quality_frame_idx,
+            "n_affine_ok": n_affine_ok,
+            "n_affine_fail": n_affine_fail,
+            "fb_fore": fb_fore,
+            "fb_cheek": fb_cheek,
+            "mask_mode": mask_mode,
+            "skinfrac_forehead": skin_fore,
+            "skinfrac_cheeks": skin_cheeks,
+        }
+
+    def _score_traces(ex: dict, *, chrom_bp: bool, save_figs: bool) -> list[dict]:
+        plain, gated, valid = ex["plain"], ex["gated"], ex["valid"]
+        quality = ex["quality"]
+        method_map = _method_fns(chrom_window_bandpass=chrom_bp)
+        variant = _variant_name(ex["mask_mode"], chrom_bp)
+        trustworthy = bool(quality and quality["trustworthy"])
+        gate_label = "trustworthy" if trustworthy else "NO-GO"
+
+        # Peak-SNR (peak-to-median) — tylko informacyjnie; headline = HEADLINE_REGION.
+        snr_peak: dict[str, float] = {}
+        for region in REGIONS_REPORT:
+            sig = methods.pos(plain[region], fs)
+            clean = estimate.bandpass_filter(estimate.detrend_signal(sig), fs)
+            snr_peak[region] = peak_snr_db(clean, fs)
+        snr_hl = snr_peak.get(HEADLINE_REGION, float("nan"))
+        if np.isfinite(snr_hl) and snr_hl >= PEAK_SNR_CONF_HIGH_DB:
+            conf_info = "high"
+        elif np.isfinite(snr_hl) and snr_hl >= PEAK_SNR_CONF_MED_DB:
+            conf_info = "med"
+        else:
+            conf_info = "low"
+        region_used = HEADLINE_REGION
+        region_reason = f"headline={region_used} (stała reguła; peak-SNR tylko info)"
+        print(
+            f"  score variant={variant}  RMS={quality['contour_rms_px']:.1f} px  "
+            f"gated {gate_label}  calib={reg_calib_source}  (4 równe okna n//4)",
+            flush=True,
+        )
+        print(
+            f"  region_used={region_used} confidence(info)={conf_info}  "
+            f"skin_f={ex['skinfrac_forehead']:.2f} skin_c={ex['skinfrac_cheeks']:.2f}  "
+            f"peakSNR_f={snr_peak['forehead']:.1f} peakSNR_c={snr_peak['cheeks']:.1f} dB",
+            flush=True,
+        )
+
+        rows_v: list[dict] = []
+        cleaned: dict[tuple[str, str, str], np.ndarray] = {}
+        window_hrs: dict[tuple[str, str, str], tuple[np.ndarray, np.ndarray]] = {}
+        pos_scene: dict[str, dict] = {}  # region → hr_scene plain/gated do headline
+
+        for region in REGIONS_REPORT:
+            for name, fn in method_map.items():
+                sig_p = fn(plain[region], fs)
+                sig_g = fn(gated[region], fs)
+                clean_p = estimate.bandpass_filter(estimate.detrend_signal(sig_p), fs)
+                clean_g = estimate.bandpass_filter(estimate.detrend_signal(sig_g), fs)
+                try:
+                    hr_scene_p = float(estimate.estimate_hr_welch(clean_p, fs))
+                except (ValueError, np.linalg.LinAlgError):
+                    hr_scene_p = float("nan")
+                try:
+                    hr_scene_g = float(estimate.estimate_hr_welch(clean_g, fs))
+                except (ValueError, np.linalg.LinAlgError):
+                    hr_scene_g = float("nan")
+                hr_ref_scene = float(hr_ref)
+                vp = validate.validate_against_hr_quarters(
+                    sig_p,
+                    fs,
+                    polar.t_s,
+                    polar.hr_bpm,
+                    video_duration_s=duration_s,
+                    valid=valid,
+                )
+                vg = validate.validate_against_hr_quarters(
+                    sig_g,
+                    fs,
+                    polar.t_s,
+                    polar.hr_bpm,
+                    video_duration_s=duration_s,
+                    valid=valid,
+                )
+                fb = ex["fb_fore"] if region == "forehead" else ex["fb_cheek"]
+                if name == "POS":
+                    pos_scene[region] = {
+                        "hr_scene_plain": hr_scene_p,
+                        "hr_scene_gated": hr_scene_g,
+                        "abs_err_scene_plain": float(abs(hr_scene_p - hr_ref_scene))
+                        if np.isfinite(hr_scene_p)
+                        else float("nan"),
+                        "abs_err_scene_gated": float(abs(hr_scene_g - hr_ref_scene))
+                        if np.isfinite(hr_scene_g)
+                        else float("nan"),
+                    }
+                row: dict = {
+                    "variant": variant,
+                    "roi_mask": ex["mask_mode"],
+                    "chrom_window_bandpass": chrom_bp,
+                    "subject": subject,
+                    "scenario": scenario,
+                    "region": region,
+                    "method": name,
+                    "hr_ref_scene": hr_ref_scene,
+                    "hr_scene_plain": hr_scene_p,
+                    "hr_scene_gated": hr_scene_g,
+                    "abs_err_scene_plain": float(abs(hr_scene_p - hr_ref_scene))
+                    if np.isfinite(hr_scene_p)
+                    else float("nan"),
+                    "abs_err_scene_gated": float(abs(hr_scene_g - hr_ref_scene))
+                    if np.isfinite(hr_scene_g)
+                    else float("nan"),
+                    "hr_ref": hr_ref_scene,
+                    "hr_plain": hr_scene_p,
+                    "hr_gated": hr_scene_g,
+                    "snr_plain": float(vp["snr_mean"]),
+                    "snr_gated": float(vg["snr_mean"]),
+                    "delta_snr": float(vg["snr_mean"] - vp["snr_mean"]),
+                    "mae_plain": float(vp["mae_bpm"]),
+                    "mae_gated": float(vg["mae_bpm"]),
+                    "rmse_plain": float(vp["rmse_bpm"]),
+                    "rmse_gated": float(vg["rmse_bpm"]),
+                    "octave_frac_plain": float(vp["octave_error_frac"]),
+                    "octave_frac_gated": float(vg["octave_error_frac"]),
+                    "fallback_pct": float(fb),
+                    "n_windows": int(vp["n_windows_used"]),
+                    "usable_t0_s": float(vp["usable_t0_s"]),
+                    "usable_t1_s": float(vp["usable_t1_s"]),
+                    "reg_rms_px": float(quality["contour_rms_px"]),
+                    "reg_iou": float(quality["iou"]),
+                    "gated_status": gate_label,
+                    "sync_mode": polar.sync_mode,
+                    "sync_offset_s": float(polar.sync_offset_s),
+                    "ref_suspect": subject == "subject03",
+                    "skinfrac_forehead": float(ex["skinfrac_forehead"]),
+                    "skinfrac_cheeks": float(ex["skinfrac_cheeks"]),
+                    "snr_peak_forehead": float(snr_peak["forehead"]),
+                    "snr_peak_cheeks": float(snr_peak["cheeks"]),
+                    "region_used": region_used,
+                    "confidence": conf_info,
+                    "region_select_reason": region_reason,
+                    "reg_calib_source": reg_calib_source,
+                }
+                for i in range(4):
+                    ta = float(vp["window_t0_s"][i])
+                    tb = float(vp["window_t1_s"][i])
+                    row[f"w{i+1}_t0_s"] = ta
+                    row[f"w{i+1}_t1_s"] = tb
+                    row[f"hr_w{i+1}_plain"] = float(vp["estimated_hr_bpm"][i])
+                    row[f"hr_w{i+1}_gated"] = float(vg["estimated_hr_bpm"][i])
+                    row[f"hr_w{i+1}_ref"] = float(vp["reference_hr_bpm"][i])
+                    row[f"w{i+1}_used"] = bool(vp["window_used"][i])
+                rows_v.append(row)
+                cleaned[(region, name, "plain")] = clean_p
+                cleaned[(region, name, "gated")] = clean_g
+                t_centers = 0.5 * (vp["window_t0_s"] + vp["window_t1_s"])
+                window_hrs[(region, name, "plain")] = (
+                    t_centers,
+                    np.asarray(vp["estimated_hr_bpm"], dtype=np.float64),
+                )
+                window_hrs[(region, name, "gated")] = (
+                    t_centers,
+                    np.asarray(vg["estimated_hr_bpm"], dtype=np.float64),
+                )
+
+        # Headline HR = POS z regionu stałego (HEADLINE_REGION = cheeks).
+        used = region_used
+        if used in pos_scene:
+            hl = pos_scene[used]
+        else:
+            hl = {
+                "hr_scene_plain": float("nan"),
+                "hr_scene_gated": float("nan"),
+                "abs_err_scene_plain": float("nan"),
+                "abs_err_scene_gated": float("nan"),
+            }
+        for row in rows_v:
+            row["hr_headline_plain"] = hl["hr_scene_plain"]
+            row["hr_headline_gated"] = hl["hr_scene_gated"]
+            row["abs_err_headline_plain"] = hl["abs_err_scene_plain"]
+            row["abs_err_headline_gated"] = hl["abs_err_scene_gated"]
+
+        if save_figs:
+            _write_tables(out_dir, rows_v, quality, gate_label)
+            if (
+                ex["frame0_rgb"] is not None
+                and ex["reg_info0"] is not None
+                and ex["affine"] is not None
+            ):
+                _save_figures(
+                    out_dir,
+                    ex["frame0_rgb"],
+                    ex["frame0_th"],
+                    ex["frame0_lm"],
+                    ex["reg_info0"],
+                    ex["affine"],
+                    quality,
+                    cleaned,
+                    window_hrs,
+                    polar,
+                    fs,
+                    rows_v,
+                )
+            (out_dir / "reg_quality.json").write_text(
+                json.dumps(
+                    {
+                        **quality,
+                        "method": ex["reg_info0"]["method"] if ex["reg_info0"] else None,
+                        "gated_status": gate_label,
+                        "affine_ok": ex["n_affine_ok"],
+                        "affine_fail": ex["n_affine_fail"],
+                        "valid_pct": float(100.0 * valid.mean()),
+                        "quality_frame_idx": ex["quality_frame_idx"],
+                        "roi_mask": ex["mask_mode"],
+                        "chrom_window_bandpass": chrom_bp,
+                        "variant": variant,
+                        "windowing": "quarters_4",
+                        "region_used": region_used,
+                        "confidence_info": conf_info,
+                        "reg_calib_source": reg_calib_source,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return rows_v
+
+    # Domyślnie: jedna ekstrakcja bbox + CHROM legacy. ab-sweep / hull / fixed — tylko za flagami.
+    rows: list[dict] = []
+    mask_modes = ("bbox", "hull") if ab_sweep else (roi_mask_mode,)
+    dual = bool(ab_sweep or chrom_window_bandpass is None)
+    chrom_modes: tuple[bool, ...] = (True, False) if dual else (bool(chrom_window_bandpass),)
+
+    for mask_mode in mask_modes:
+        ex = _extract_traces(mask_mode)
+        for chrom_bp in chrom_modes:
+            save_figs = (mask_mode == mask_modes[-1]) and (chrom_bp == chrom_modes[-1])
+            rows.extend(_score_traces(ex, chrom_bp=chrom_bp, save_figs=save_figs))
+        if ab_sweep:
+            _write_ab_table(out_dir, rows)
+
+    qpath = out_dir / "reg_quality.json"
+    quality_dict = (
+        json.loads(qpath.read_text(encoding="utf-8"))
+        if qpath.is_file()
+        else ex["quality"]
     )
-    return {"rows": rows, "quality": quality, "gated_status": gate_label}
+    return {
+        "rows": rows,
+        "quality": quality_dict,
+        "gated_status": rows[0]["gated_status"] if rows else "n/a",
+    }
+
+
+def _write_ab_table(out_dir: Path, rows: list[dict]) -> None:
+    """Zbiorcza tabela A/B (4 warianty) → metrics_ab.csv + metrics_ab.md.
+
+    Scala z istniejącym plikiem (np. osobny przebieg bbox, potem hull).
+    """
+    fields = [
+        "variant",
+        "roi_mask",
+        "chrom_window_bandpass",
+        "region",
+        "method",
+        "mae_plain",
+        "mae_gated",
+        "octave_frac_plain",
+        "octave_frac_gated",
+        "hr_ref",
+        "hr_plain",
+        "hr_gated",
+        "delta_snr",
+        "sync_offset_s",
+        "gated_status",
+        "reg_rms_px",
+    ]
+    csv_path = out_dir / "metrics_ab.csv"
+    merged: dict[tuple, dict] = {}
+    if csv_path.is_file():
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            for old in csv.DictReader(f):
+                key = (old.get("variant"), old.get("region"), old.get("method"))
+                # odtwórz typy numeryczne luźno — DictWriter i tak pisze stringi
+                merged[key] = old
+    for r in rows:
+        key = (r.get("variant"), r.get("region"), r.get("method"))
+        merged[key] = r
+    out_rows = list(merged.values())
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in out_rows:
+            w.writerow(r)
+    rows = out_rows  # do markdown poniżej
+    lines = [
+        "# A/B ROI × CHROM",
+        "",
+        "| variant | region | method | MAE plain | MAE gated | % oktaw plain | "
+        "HR plain | sync offset |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for r in rows:
+        mae_p = float(r["mae_plain"])
+        mae_g = float(r["mae_gated"])
+        oct_p = float(r["octave_frac_plain"])
+        hr_p = float(r["hr_plain"])
+        off = float(r["sync_offset_s"])
+        lines.append(
+            f"| {r['variant']} | {r['region']} | {r['method']} | "
+            f"{mae_p:.2f} | {mae_g:.2f} | {100 * oct_p:.0f}% | {hr_p:.1f} | {off:.3f} |"
+        )
+    (out_dir / "metrics_ab.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"A/B → {csv_path}")
 
 
 def _write_tables(out_dir: Path, rows: list[dict], quality: dict, gate_label: str) -> None:
     fields = [
         "region",
         "method",
-        "hr_ref",
-        "hr_plain",
-        "hr_gated",
-        "delta_snr",
+        "hr_ref_scene",
+        "hr_scene_plain",
+        "hr_scene_gated",
+        "abs_err_scene_plain",
+        "abs_err_scene_gated",
+        "hr_w1_plain",
+        "hr_w1_gated",
+        "hr_w1_ref",
+        "hr_w2_plain",
+        "hr_w2_gated",
+        "hr_w2_ref",
+        "hr_w3_plain",
+        "hr_w3_gated",
+        "hr_w3_ref",
+        "hr_w4_plain",
+        "hr_w4_gated",
+        "hr_w4_ref",
         "mae_plain",
         "mae_gated",
         "rmse_plain",
         "rmse_gated",
         "octave_frac_plain",
         "octave_frac_gated",
+        "delta_snr",
+        "n_windows",
+        "usable_t0_s",
+        "usable_t1_s",
         "fallback_pct",
         "gated_status",
         "reg_rms_px",
         "reg_iou",
+        "sync_mode",
+        "sync_offset_s",
+        "roi_mask",
+        "ref_suspect",
+        "skinfrac_forehead",
+        "skinfrac_cheeks",
+        "snr_peak_forehead",
+        "snr_peak_cheeks",
+        "region_used",
+        "confidence",
+        "hr_headline_plain",
+        "abs_err_headline_plain",
+        "reg_calib_source",
     ]
     csv_path = out_dir / "metrics.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -508,21 +971,32 @@ def _write_tables(out_dir: Path, rows: list[dict], quality: dict, gate_label: st
         for r in rows:
             w.writerow(r)
 
+    off = rows[0].get("sync_offset_s", float("nan")) if rows else float("nan")
     lines = [
-        f"# Metryki — rejestracja RMS={quality['contour_rms_px']:.1f} px, "
-        f"IoU={quality['iou']:.3f}, gated **{gate_label}** (próg {REG_GO_RMS_PX:.0f} px)",
+        f"# Metryki — RMS={quality['contour_rms_px']:.1f} px, IoU={quality['iou']:.3f}, "
+        f"gated **{gate_label}** (próg {REG_GO_RMS_PX:.0f} px), "
+        f"sync_offset={off:.3f} s, okna: 4 kwartalne",
         "",
-        "| region | metoda | HR ref | HR plain | HR gated | ΔSNR | MAE plain | MAE gated | "
-        "RMSE plain | RMSE gated | % oktaw plain | % oktaw gated | fallback% |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| region | metoda | HR_ref | HR_scena plain | |err| plain | "
+        "w1 p/r | w2 p/r | w3 p/r | w4 p/r | MAE_p | RMSE_p | %okt_p | "
+        "MAE_g | ΔSNR |",
+        "|---|---|---:|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for r in rows:
+        def _wr(i: int) -> str:
+            ep = r.get(f"hr_w{i}_plain", float("nan"))
+            er = r.get(f"hr_w{i}_ref", float("nan"))
+            if not (np.isfinite(ep) and np.isfinite(er)):
+                return "—"
+            return f"{ep:.0f}/{er:.0f}"
+
         lines.append(
-            f"| {r['region']} | {r['method']} | {r['hr_ref']:.1f} | {r['hr_plain']:.2f} | "
-            f"{r['hr_gated']:.2f} | {r['delta_snr']:+.2f} | {r['mae_plain']:.2f} | "
-            f"{r['mae_gated']:.2f} | {r['rmse_plain']:.2f} | {r['rmse_gated']:.2f} | "
-            f"{100 * r['octave_frac_plain']:.0f}% | {100 * r['octave_frac_gated']:.0f}% | "
-            f"{r['fallback_pct']:.1f} |"
+            f"| {r['region']} | {r['method']} | {r['hr_ref_scene']:.1f} | "
+            f"{r['hr_scene_plain']:.1f} | {r['abs_err_scene_plain']:.1f} | "
+            f"{_wr(1)} | {_wr(2)} | {_wr(3)} | {_wr(4)} | "
+            f"{r['mae_plain']:.2f} | {r['rmse_plain']:.2f} | "
+            f"{100 * r['octave_frac_plain']:.0f}% | {r['mae_gated']:.2f} | "
+            f"{r['delta_snr']:+.2f} |"
         )
     (out_dir / "metrics.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Tabela → {csv_path}")
@@ -699,21 +1173,213 @@ def _save_figures(
     print(f"Figury → {out_dir}/fig_*.png")
 
 
+_SUMMARY_CSV_FIELDS = [
+    "subject",
+    "scenario",
+    "region",
+    "method",
+    "hr_ref_scene",
+    "hr_scene_plain",
+    "abs_err_scene_plain",
+    "hr_scene_gated",
+    "abs_err_scene_gated",
+    "hr_headline_plain",
+    "hr_headline_gated",
+    "abs_err_headline_plain",
+    "abs_err_headline_gated",
+    "hr_w1_plain",
+    "hr_w2_plain",
+    "hr_w3_plain",
+    "hr_w4_plain",
+    "hr_w1_gated",
+    "hr_w2_gated",
+    "hr_w3_gated",
+    "hr_w4_gated",
+    "hr_w1_ref",
+    "hr_w2_ref",
+    "hr_w3_ref",
+    "hr_w4_ref",
+    "mae_plain",
+    "rmse_plain",
+    "octave_frac_plain",
+    "mae_gated",
+    "rmse_gated",
+    "octave_frac_gated",
+    "delta_snr",
+    "n_windows",
+    "reg_rms_px",
+    "reg_iou",
+    "gated_status",
+    "sync_mode",
+    "sync_offset_s",
+    "usable_t0_s",
+    "usable_t1_s",
+    "fallback_pct",
+    "ref_suspect",
+    "skinfrac_forehead",
+    "skinfrac_cheeks",
+    "snr_peak_forehead",
+    "snr_peak_cheeks",
+    "region_used",
+    "confidence",
+    "region_select_reason",
+    "reg_calib_source",
+]
+
+
+def _fmt_cell(v) -> str:
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, (int, float)):
+        if not np.isfinite(v):
+            return ""
+        if isinstance(v, float) and abs(v - round(v)) < 1e-9:
+            return f"{v:.4g}"
+        return f"{v:.4g}" if isinstance(v, float) else str(v)
+    return "" if v is None else str(v)
+
+
+def _write_all_subjects_csv(all_rows: list[dict], out_root: Path) -> Path:
+    path = out_root / "all_subjects.csv"
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_SUMMARY_CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in all_rows:
+            w.writerow({k: r.get(k, "") for k in _SUMMARY_CSV_FIELDS})
+    print(f"CSV zbiorczy → {path}")
+    return path
+
+
 def _write_summary(all_rows: list[dict], out_root: Path) -> None:
+    """Pełny zrzut do analizy + krótki werdykt; równolegle ``all_subjects.csv``."""
+    _write_all_subjects_csv(all_rows, out_root)
     path = out_root / "summary.md"
+
     lines = [
-        "# Podsumowanie demo_run",
+        "# Podsumowanie demo_run — wszyscy badani (pipeline docelowy)",
         "",
-        "| subject | scenario | region | metoda | MAE plain | MAE gated | ΔSNR | "
-        "% oktaw plain | gated | RMS px |",
-        "|---|---|---|---|---:|---:|---:|---:|---|---:|",
+        "Default: **bbox** · **POS** + **CHROM legacy** · plain/gated · "
+        "**4 równe okna** · headline=**cheeks** (stała) · "
+        "kalibracja rejestracji **per scena** · "
+        "skinfrac/peak-SNR tylko informacyjnie.",
+        "",
+        "`ref_suspect=True` → **subject03** (Polar do ~190 BPM — wykluczaj z wniosków zbiorczych).",
+        "",
+        "Zbiorczy CSV: [`all_subjects.csv`](all_subjects.csv).",
+        "",
+        "## Pełna tabela (subject × scena × region × metoda)",
+        "",
     ]
+
+    # Markdown table header = wszystkie kolumny
+    lines.append("| " + " | ".join(_SUMMARY_CSV_FIELDS) + " |")
+    lines.append("|" + "|".join(["---"] * len(_SUMMARY_CSV_FIELDS)) + "|")
     for r in all_rows:
+        cells = [_fmt_cell(r.get(k)) for k in _SUMMARY_CSV_FIELDS]
+        lines.append("| " + " | ".join(cells) + " |")
+
+    # Krótki werdykt na podstawie danych (bez naciągania)
+    lines += ["", "## Krótki werdykt", ""]
+    by_key: dict[tuple, list] = {}
+    for r in all_rows:
+        if r.get("ref_suspect"):
+            continue
+        key = (r["subject"], r["scenario"], r["method"], r["region"])
+        by_key.setdefault(key, []).append(r)
+
+    nogo = sorted(
+        {
+            (r["subject"], r["scenario"])
+            for r in all_rows
+            if r.get("gated_status") == "NO-GO"
+        }
+    )
+    if nogo:
         lines.append(
-            f"| {r['subject']} | {r['scenario']} | {r['region']} | {r['method']} | "
-            f"{r['mae_plain']:.2f} | {r['mae_gated']:.2f} | {r['delta_snr']:+.2f} | "
-            f"{100 * r['octave_frac_plain']:.0f}% | {r['gated_status']} | {r['reg_rms_px']:.1f} |"
+            "- **NO-GO rejestracji** (RMS > próg): "
+            + ", ".join(f"{s}/{c}" for s, c in nogo)
+            + " — gated niewiarygodny."
         )
+    else:
+        lines.append("- Brak scen NO-GO w tym przebiegu.")
+
+    # POS forehead |err| sceny — dobre / słabe
+    pos_fore = [
+        r
+        for r in all_rows
+        if r.get("method") == "POS"
+        and r.get("region") == "forehead"
+        and not r.get("ref_suspect")
+    ]
+    good, weak = [], []
+    for r in pos_fore:
+        err = r.get("abs_err_scene_plain", float("nan"))
+        if not isinstance(err, (int, float)) or not np.isfinite(err):
+            continue
+        tag = f"{r['subject']}/{r['scenario']} (|err|={err:.1f})"
+        if err <= 10.0 and r.get("gated_status") != "NO-GO":
+            good.append(tag)
+        elif err >= 25.0 or r.get("gated_status") == "NO-GO":
+            weak.append(tag)
+    if good:
+        lines.append("- **POS czoło — wiarygodniejsze** (|err|_scena ≤ 10): " + "; ".join(good))
+    if weak:
+        lines.append("- **POS czoło — słabe** (|err| ≥ 25 lub NO-GO): " + "; ".join(weak))
+
+    # plain vs gated: ile razy gated ma niższe MAE
+    n_cmp = n_g_better = 0
+    for r in all_rows:
+        if r.get("ref_suspect") or r.get("gated_status") == "NO-GO":
+            continue
+        mp, mg = r.get("mae_plain"), r.get("mae_gated")
+        if (
+            isinstance(mp, (int, float))
+            and isinstance(mg, (int, float))
+            and np.isfinite(mp)
+            and np.isfinite(mg)
+        ):
+            n_cmp += 1
+            if mg < mp:
+                n_g_better += 1
+    if n_cmp:
+        lines.append(
+            f"- **Plain vs gated (MAE okienkowe, bez subject03/NO-GO):** "
+            f"gated lepsze w {n_g_better}/{n_cmp} wierszach "
+            f"({100 * n_g_better / n_cmp:.0f}%) — nie uznawać gated za domyślny zwycięzcę."
+        )
+    scene_meta = {}
+    for r in all_rows:
+        key = (r["subject"], r["scenario"])
+        if key not in scene_meta:
+            scene_meta[key] = r
+    n_scenes = sum(1 for r in scene_meta.values() if not r.get("ref_suspect"))
+    n_nogo = sum(
+        1
+        for r in scene_meta.values()
+        if (not r.get("ref_suspect")) and r.get("gated_status") == "NO-GO"
+    )
+    n_fallback = sum(
+        1
+        for r in scene_meta.values()
+        if str(r.get("reg_calib_source", "")).startswith("fallback")
+    )
+    lines.append(
+        f"- Headline zawsze **cheeks**; czoło raportowane osobno (inset włosów "
+        f"`FOREHEAD_TOP_INSET_FRAC`)."
+    )
+    lines.append(
+        f"- Sceny **NO-GO** rejestracji (bez subject03): {n_nogo}/{n_scenes}; "
+        f"kalibracja fallback: {n_fallback} "
+        f"(`demo_results/<subject>/<scena>/reg_calib.json`)."
+    )
+    lines.append(
+        "- `confidence` / `snr_peak_*` / `skinfrac_*` — kolumny informacyjne, "
+        "nie bramkują danych."
+    )
+    lines.append(
+        "- Sceny z ruchem (s2/s4) oraz approach (s5) zwykle gorsze niż rest/drone."
+    )
+    lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Zbiorcza → {path}")
 
@@ -729,13 +1395,30 @@ def main() -> None:
         default=DEMO_DATA,
         help="Katalog wejściowy (domyślnie demo_data/)",
     )
+    parser.add_argument(
+        "--roi-mask",
+        choices=("bbox", "hull"),
+        default="bbox",
+        help="Maska ROI (default: bbox = pipeline docelowy; hull = opcja eksperym.)",
+    )
+    parser.add_argument(
+        "--chrom-mode",
+        choices=("legacy", "fixed", "both"),
+        default="legacy",
+        help="CHROM (default: legacy = bandpass per-okno; fixed/both = opcja eksperym.)",
+    )
+    parser.add_argument(
+        "--ab-sweep",
+        action="store_true",
+        help="Opcja eksperym.: A/B bbox/hull × chrom legacy/fixed (nie default)",
+    )
     args = parser.parse_args()
 
     demo_data = args.demo_data.resolve()
     global CALIB_PATH
-    CALIB_PATH = demo_data / "reg_calib.json"
+    CALIB_PATH = demo_data / "reg_calib.json"  # legacy path; nie używany per-subject
 
-    ensure_calibration(demo_data, force=args.recalibrate)
+    DEMO_RESULTS.mkdir(parents=True, exist_ok=True)
 
     sessions = discover_demo_sessions(demo_data)
     if args.subject:
@@ -745,21 +1428,60 @@ def main() -> None:
     if not sessions:
         raise SystemExit("Brak sesji do przetworzenia.")
 
+    if args.chrom_mode == "both":
+        chrom_bp: bool | None = None
+    else:
+        chrom_bp = args.chrom_mode == "legacy"
     all_rows: list[dict] = []
     for subject, scenario, session_dir in sessions:
         out_dir = DEMO_RESULTS / subject / scenario
-        result = run_session(subject, scenario, session_dir, out_dir)
+        calib_log = out_dir / "calib_stderr.log"
+        with _redirect_stderr_to(calib_log):
+            _, calib_src = ensure_scene_calibration(
+                demo_data,
+                subject,
+                scenario,
+                session_dir,
+                force=args.recalibrate,
+            )
+        result = run_session(
+            subject,
+            scenario,
+            session_dir,
+            out_dir,
+            roi_mask_mode=args.roi_mask,
+            chrom_window_bandpass=chrom_bp,
+            ab_sweep=args.ab_sweep,
+            reg_calib_source=calib_src,
+        )
+        if result.get("skipped"):
+            print(f"\n→ {subject}/{scenario}: SKIP (sync sanity)")
+            continue
         all_rows.extend(result["rows"])
+        q = result["quality"] or {}
+        sample = result["rows"][0] if result["rows"] else {}
         print(
-            f"\n→ {subject}/{scenario}: RMS={result['quality']['contour_rms_px']:.1f} px "
-            f"({result['gated_status']})"
+            f"\n→ {subject}/{scenario}: RMS={q.get('contour_rms_px', float('nan')):.1f} px "
+            f"({result['gated_status']}) region_used={sample.get('region_used')} "
+            f"confidence={sample.get('confidence')}"
         )
         for r in result["rows"]:
-            if r["region"] == "forehead":
-                print(
-                    f"   {r['method']}: MAE_p={r['mae_plain']:.2f} MAE_g={r['mae_gated']:.2f} "
-                    f"ΔSNR={r['delta_snr']:+.2f} oktawy_p={100 * r['octave_frac_plain']:.0f}%"
-                )
+            if r["method"] != "POS":
+                continue
+            err = r.get("abs_err_scene_plain", float("nan"))
+            mark = "*" if r["region"] == r.get("region_used") else " "
+            print(
+                f"  {mark}{r['region']}/{r['method']}: |err|={err:.1f} "
+                f"MAE={r['mae_plain']:.2f} "
+                f"HR={r.get('hr_scene_plain', float('nan')):.0f}/"
+                f"ref={r.get('hr_ref_scene', float('nan')):.0f}"
+            )
+        if sample:
+            print(
+                f"   headline(POS/{sample.get('region_used')}): "
+                f"|err|={sample.get('abs_err_headline_plain', float('nan')):.1f} "
+                f"HR={sample.get('hr_headline_plain', float('nan')):.0f}"
+            )
 
     _write_summary(all_rows, DEMO_RESULTS)
 

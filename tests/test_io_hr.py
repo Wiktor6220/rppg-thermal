@@ -30,9 +30,12 @@ def test_load_reference_hr_is_hr_csv_only():
     assert series is not None
     assert src == "hr_csv"
     assert series.hr_bpm.size >= 10
-    # Bez skipu: pierwsza próbka ≈ start wideo (t_s ≈ 0)
     assert POLAR_HR_SKIP_SAMPLES == 0
+    # Przy sync absolutnym Polar zwykle startuje przed wideo → t_s.min() ≤ 0.
+    # Fallback relative_zero: t_s[0] == 0.
     assert float(series.t_s.min()) < 1.0
+    if series.sync_mode == "absolute_utc":
+        assert abs(float(series.sync_offset_s)) < 3600.0
 
 
 @pytest.mark.skipif(not HAS_S02, reason=f"brak data/{EVAL_SUBJECT}/s1_rest_rest")
@@ -44,7 +47,7 @@ def test_load_polar_hr_s02_s1_resting_range():
 
 
 def test_load_polar_hr_no_skip_starts_at_zero(tmp_path, monkeypatch):
-    """t0 = pierwszy wiersz; przy skip=0 pierwsza próbka ma t_s == 0."""
+    """Bez video_path / bez daty w nagłówku: t0 = pierwszy wiersz → t_s[0] == 0."""
     session = tmp_path / "subject99" / "s1_rest_rest"
     session.mkdir(parents=True)
     hr_path = session / "subject99_s1_HR.csv"
@@ -60,4 +63,31 @@ def test_load_polar_hr_no_skip_starts_at_zero(tmp_path, monkeypatch):
     series = load_polar_hr("subject99", "s1_rest_rest", data_dir=tmp_path, skip_samples=0)
     assert series is not None
     assert series.t_s[0] == 0.0
+    assert series.sync_mode == "relative_zero"
     assert len(series.hr_bpm) == 10
+
+
+HAS_S01 = (DATA / "subject01" / "s1_rest_rest").is_dir()
+
+
+@pytest.mark.skipif(not HAS_S01, reason="brak data/subject01/s1_rest_rest")
+def test_subject01_s1_absolute_sync_offset_near_4s():
+    """creation_time RGB UTC vs Polar lokalny → offset start_wideo−start_HR ≈ 4.4 s."""
+    from src.io_layer import load_polar_hr_csv, probe_video
+
+    session = DATA / "subject01" / "s1_rest_rest"
+    rgb = session / "subject01_s1_RGB.MP4"
+    hr_path = session / "subject01_s1_HR.csv"
+    if not rgb.is_file() or not hr_path.is_file():
+        pytest.skip("brak RGB/HR DJI w subject01/s1_rest_rest")
+    series = load_polar_hr_csv(
+        hr_path,
+        skip_samples=0,
+        video_path=rgb,
+        video_duration_s=probe_video(rgb).duration_s,
+    )
+    assert series is not None
+    assert series.sync_mode == "absolute_utc"
+    assert 3.0 < float(series.sync_offset_s) < 6.0
+    # Zachowany offset ułamkowy: pierwsza próbka HR nie jest zerowana do 0.
+    assert float(series.t_s[0]) < -3.0

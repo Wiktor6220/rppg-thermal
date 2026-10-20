@@ -57,7 +57,12 @@ def extract_rgb_trace(
 
 
 def compute_perfusion_mask(thermal_frame: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
-    """Piksele ROI powyżej mean + k·std (bez normalizacji per klatka)."""
+    """Piksele ROI powyżej mean + k·std (bez normalizacji per klatka).
+
+    Świadome ograniczenie: źródło to wizualny podgląd MP4 z AGC (nie radiometria).
+    Próg ``mean + k·std`` na względnej jasności w ROI dryfuje między klatkami —
+    tego nie da się „naprawić” bez prawdziwych temperatur; nie zmieniamy heurystyki.
+    """
     thermal_frame = np.asarray(thermal_frame, dtype=np.float64)
     roi_mask = np.asarray(roi_mask, dtype=bool)
     if thermal_frame.shape != roi_mask.shape:

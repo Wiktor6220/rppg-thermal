@@ -77,3 +77,12 @@ def test_chrom_pos_recover_hr_where_green_fails(seed):
     assert abs(hr_pos - TRUE_HR_BPM) <= TOLERANCE_BPM
     # GREEN przyciągany do częstości artefaktu (~96 bpm).
     assert abs(hr_green - TRUE_HR_BPM) > TOLERANCE_BPM
+
+
+def test_chrom_fixed_recovers_known_hr():
+    """CHROM bez bandpassu per-okno + Hanning też odzyskuje HR z syntetyki."""
+    from src.methods import chrom_fixed
+
+    rgb_signal, _ = generate_synthetic_rgb(fs=FS_TEST, duration_s=30.0, hr_bpm=TRUE_HR_BPM)
+    estimated_bpm = dominant_hr_bpm(chrom_fixed(rgb_signal, FS_TEST), FS_TEST)
+    assert abs(estimated_bpm - TRUE_HR_BPM) <= TOLERANCE_BPM

@@ -27,11 +27,24 @@ def green(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
     return g / (g.mean() + _EPS) - 1.0
 
 
-def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
-    """CHROM: okna ~1.6 s, filtr Xs/Ys, alpha, overlap-add."""
+def chrom(
+    rgb_trace: np.ndarray,
+    fs: float,
+    *,
+    window_bandpass: bool = True,
+    hann_ola: bool = False,
+) -> np.ndarray:
+    """CHROM: okna ~1.6 s, Xs/Ys, alpha, overlap-add.
+
+    ``window_bandpass=True`` (legacy): bandpass w każdym oknie ~1.6 s — przy fs≈30
+    dolna krawędź 0.7 Hz ≈ długość okna → transjenty ``sosfiltfilt`` dominują.
+    ``window_bandpass=False``: bez filtracji per-okno (pełnodługościowy bandpass
+    jest w ``estimate``). ``hann_ola=True``: taper Hanninga przy overlap-add.
+    """
     rgb_trace = _validate_rgb_trace(rgb_trace)
     n_samples = rgb_trace.shape[0]
     window_len = max(2, min(n_samples, int(round(_WINDOW_SEC * fs))))
+    taper = np.hanning(window_len) if hann_ola else None
 
     signal = np.zeros(n_samples, dtype=np.float64)
     for start in range(0, n_samples - window_len + 1):
@@ -41,15 +54,25 @@ def chrom(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
 
         x_s = 3.0 * r_n - 2.0 * g_n
         y_s = 1.5 * r_n + g_n - 1.5 * b_n
-        x_f = bandpass_filter(x_s, fs)
-        y_f = bandpass_filter(y_s, fs)
+        if window_bandpass:
+            x_f = bandpass_filter(x_s, fs)
+            y_f = bandpass_filter(y_s, fs)
+        else:
+            x_f, y_f = x_s, y_s
 
         alpha = np.std(x_f) / (np.std(y_f) + _EPS)
         chrom_window = x_f - alpha * y_f
         chrom_window -= chrom_window.mean()
+        if taper is not None:
+            chrom_window = chrom_window * taper
         signal[start : start + window_len] += chrom_window
 
     return signal
+
+
+def chrom_fixed(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
+    """CHROM bez bandpassu per-okno + Hanning overlap-add (zalecany wariant)."""
+    return chrom(rgb_trace, fs, window_bandpass=False, hann_ola=True)
 
 
 def pos(rgb_trace: np.ndarray, fs: float) -> np.ndarray:

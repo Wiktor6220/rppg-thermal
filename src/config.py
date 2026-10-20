@@ -18,6 +18,21 @@ REF_SOURCE: str = "hr_csv"
 VALIDATION_WINDOW_SEC: float = 10.0
 VALIDATION_STEP_SEC: float = 5.0
 MIN_VALID_RATIO: float = 0.5  # min. udział valid[] w oknie
+# Demo / praca: 4 równe okna (n//4 klatek; ostatnie bierze resztę)
+QUARTER_FIRST3_SEC: float = 15.0  # legacy, nieużywane przy równym podziale
+N_QUARTER_WINDOWS: int = 4
+
+# --- ROI czoła (deterministyczny inset poniżej linii włosów) ---
+FOREHEAD_TOP_INSET_FRAC: float = 0.40  # odetnij górne 40% wysokości bboxa czoła
+
+# --- Metryki jakości ROI (tylko informacyjne — nie bramkują wyboru) ---
+SKIN_FRAC_MIN: float = 0.50  # legacy / diagnostyka
+REGION_MIN_VALID_FRAC: float = 0.30
+PEAK_SNR_CONF_HIGH_DB: float = 2.0
+PEAK_SNR_CONF_MED_DB: float = -2.0
+PEAK_SNR_BIN_WIDTH_HZ: float = 0.2
+PEAK_SNR_N_HARMONICS: int = 2
+HEADLINE_REGION: str = "cheeks"  # stały region headline (bez selektora)
 
 # --- Maska perfuzji ---
 PERFUSION_TEMP_STD_FACTOR: float = 0.5  # próg: mean + k*std w ROI

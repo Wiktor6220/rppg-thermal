@@ -8,7 +8,11 @@ import sys
 import cv2
 import numpy as np
 
-from src.config import FACE_LANDMARKER_MODEL_PATH, FACE_MESH_LANDMARK_INDICES
+from src.config import (
+    FACE_LANDMARKER_MODEL_PATH,
+    FACE_MESH_LANDMARK_INDICES,
+    FOREHEAD_TOP_INSET_FRAC,
+)
 
 _FACE_LANDMARKER = None  # singleton FaceLandmarker
 
@@ -131,7 +135,11 @@ def make_cropping_detector(
 
 
 def select_roi_from_landmarks(landmarks: np.ndarray, region: str) -> np.ndarray:
-    """Bbox ROI [y0, x0, y1, x1] z landmarków regionu."""
+    """Bbox ROI [y0, x0, y1, x1] z landmarków regionu.
+
+    Dla ``forehead``: inset od góry o ``FOREHEAD_TOP_INSET_FRAC`` wysokości bboxa
+    (deterministycznie poniżej linii włosów).
+    """
     if region not in FACE_MESH_LANDMARK_INDICES:
         raise ValueError(
             f"Nieznany region ROI: {region!r}. Dostępne: {list(FACE_MESH_LANDMARK_INDICES)}"
@@ -141,7 +149,41 @@ def select_roi_from_landmarks(landmarks: np.ndarray, region: str) -> np.ndarray:
     y0 = max(0, int(np.floor(points[:, 1].min())))
     x1 = int(np.ceil(points[:, 0].max()))
     y1 = int(np.ceil(points[:, 1].max()))
+    if region == "forehead":
+        box_h = max(1, y1 - y0)
+        y0 = y0 + int(round(FOREHEAD_TOP_INSET_FRAC * box_h))
+        y0 = min(y0, y1 - 1)
     return np.array([y0, x0, y1, x1], dtype=int)
+
+
+def roi_mask_from_landmarks(
+    landmarks: np.ndarray,
+    region: str,
+    shape: tuple[int, int],
+    mode: str = "bbox",
+) -> np.ndarray:
+    """Maska bool ROI: ``bbox`` (prostokąt) albo ``hull`` (wypełniona otoczka wypukła).
+
+    Hull unika narożników bboxa (czoło: brwi / linia włosów).
+    """
+    if region not in FACE_MESH_LANDMARK_INDICES:
+        raise ValueError(
+            f"Nieznany region ROI: {region!r}. Dostępne: {list(FACE_MESH_LANDMARK_INDICES)}"
+        )
+    height, width = int(shape[0]), int(shape[1])
+    mode_l = mode.strip().lower()
+    if mode_l == "bbox":
+        y0, x0, y1, x1 = (int(v) for v in select_roi_from_landmarks(landmarks, region))
+        mask = np.zeros((height, width), dtype=bool)
+        mask[y0:y1, x0:x1] = True
+        return mask
+    if mode_l == "hull":
+        points = landmarks[FACE_MESH_LANDMARK_INDICES[region]][:, :2].astype(np.float32)
+        hull = cv2.convexHull(points)
+        canvas = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillConvexPoly(canvas, np.round(hull).astype(np.int32), 1)
+        return canvas.astype(bool)
+    raise ValueError(f"mode ROI musi być 'bbox' albo 'hull', otrzymano {mode!r}")
 
 
 def _fill_missing_roi(
