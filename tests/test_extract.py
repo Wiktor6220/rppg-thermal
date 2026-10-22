@@ -1,72 +1,35 @@
-"""Testy ekstrakcji RGB z ROI i maski perfuzji (dane syntetyczne)."""
+"""Testy ekstrakcji RGB z ROI i bramkowania termiką (dane syntetyczne)."""
 
 import numpy as np
 import pytest
 
+import src.extract as extract
 from src.estimate import snr_rppg
 from src.extract import (
-    compute_perfusion_mask,
-    extract_rgb_trace,
     gated_means_per_frame_from_samples,
-    gated_means_per_window_from_samples,
+    mean_rgb_in_mask,
+    sample_roi_temps_via_affine,
 )
 from src.methods import green
-from tests.synthetic import dominant_hr_bpm, generate_synthetic_frames
+from tests.synthetic import generate_synthetic_frames
 
 FS_TEST = 30.0
 TRUE_HR_BPM = 72.0
-TOLERANCE_BPM = 5.0
 SEEDS = [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_perfusion_mask_matches_patch(seed):
-    """Maska perfuzji pokrywa się z łatą i mieści się w ROI."""
-    d = generate_synthetic_frames(fs=FS_TEST, hr_bpm=TRUE_HR_BPM, seed=seed)
-    mask = compute_perfusion_mask(d["thermal_frames"][0], d["roi_mask"])
-    truth = d["patch_mask"]
-
-    assert (mask & ~d["roi_mask"]).sum() == 0
-    jaccard = (mask & truth).sum() / (mask | truth).sum()
-    assert jaccard >= 0.9
-
-
-def test_perfusion_mask_shape_mismatch_raises():
-    with pytest.raises(ValueError):
-        compute_perfusion_mask(np.zeros((10, 10)), np.ones((8, 8), dtype=bool))
-
-
-@pytest.mark.parametrize("seed", SEEDS)
-def test_extract_rgb_trace_shape_and_hr(seed):
-    """Ekstrakcja z ROI → (N, 3) i odzyskany HR."""
-    d = generate_synthetic_frames(fs=FS_TEST, hr_bpm=TRUE_HR_BPM, seed=seed)
-    trace = extract_rgb_trace(d["rgb_frames"], d["roi_positions"], d["valid"])
-
-    assert trace.shape == (d["rgb_frames"].shape[0], 3)
-    hr = dominant_hr_bpm(green(trace, FS_TEST), FS_TEST)
-    assert abs(hr - TRUE_HR_BPM) <= TOLERANCE_BPM
-
-
-@pytest.mark.parametrize("seed", SEEDS)
 def test_thermal_gating_improves_snr(seed):
-    """Bramkowanie (ścieżka potoku: próbki → per-frame) daje wyższe SNR niż plain ROI."""
+    """Bramkowanie (ścieżka potoku: próbki -> per-frame) daje wyższe SNR niż plain ROI."""
     d = generate_synthetic_frames(fs=FS_TEST, hr_bpm=TRUE_HR_BPM, seed=seed)
     rgb = d["rgb_frames"]
     thermal = d["thermal_frames"]
-    n, height, width, _ = rgb.shape
+    roi = d["roi_mask"]
+    ys, xs = np.where(roi)
 
-    plain = extract_rgb_trace(rgb, d["roi_positions"], d["valid"])
-    rgb_pix: list[np.ndarray | None] = []
-    temps: list[np.ndarray | None] = []
-    for i in range(n):
-        roi = np.asarray(d["roi_positions"][i], dtype=bool)
-        if roi.shape != (height, width):
-            y0, x0, y1, x1 = (int(v) for v in roi)
-            roi = np.zeros((height, width), dtype=bool)
-            roi[y0:y1, x0:x1] = True
-        ys, xs = np.where(roi)
-        rgb_pix.append(rgb[i][ys, xs])
-        temps.append(thermal[i][ys, xs].astype(np.float64))
+    plain = np.stack([mean_rgb_in_mask(frame, roi) for frame in rgb])
+    rgb_pix: list[np.ndarray | None] = [frame[ys, xs] for frame in rgb]
+    temps: list[np.ndarray | None] = [th[ys, xs].astype(np.float64) for th in thermal]
 
     gated, _ = gated_means_per_frame_from_samples(rgb_pix, temps, plain)
     snr_plain = snr_rppg(green(plain, FS_TEST), FS_TEST, TRUE_HR_BPM)
@@ -76,52 +39,41 @@ def test_thermal_gating_improves_snr(seed):
     assert snr_gated > snr_plain
 
 
-def test_extract_rejects_length_mismatch():
-    d = generate_synthetic_frames(fs=FS_TEST, duration_s=2.0, seed=0)
-    with pytest.raises(ValueError):
-        extract_rgb_trace(d["rgb_frames"], d["roi_positions"][:-1], d["valid"])
+def test_mean_rgb_in_empty_mask_falls_back_to_frame_mean():
+    frame = np.arange(2 * 2 * 3, dtype=np.float64).reshape(2, 2, 3)
+    out = mean_rgb_in_mask(frame, np.zeros((2, 2), dtype=bool))
+    np.testing.assert_allclose(out, frame.reshape(-1, 3).mean(axis=0))
 
 
-def test_extract_supports_bbox_roi():
-    d = generate_synthetic_frames(fs=FS_TEST, duration_s=2.0, seed=0)
-    n = d["rgb_frames"].shape[0]
-    bbox = np.array([4, 4, d["rgb_frames"].shape[1] - 4, d["rgb_frames"].shape[2] - 4])
-
-    trace_bbox = extract_rgb_trace(d["rgb_frames"], [bbox] * n, d["valid"])
-    trace_mask = extract_rgb_trace(d["rgb_frames"], d["roi_positions"], d["valid"])
-    np.testing.assert_allclose(trace_bbox, trace_mask)
-
-
-def test_gated_per_window_one_threshold():
-    """Per-window: jeden próg na okno; stała decyzja fallback wewnątrz okna."""
-    n = 30
-    plain = np.tile(np.array([0.1, 0.2, 0.3]), (n, 1))
-    temps = []
-    rgb_pix = []
-    for _ in range(n):
-        t = np.array([0.0, 0.0, 1.0, 1.0, 1.0])
-        r = np.array(
-            [[0.1, 0.1, 0.1], [0.1, 0.1, 0.1], [0.9, 0.9, 0.9], [0.9, 0.9, 0.9], [0.9, 0.9, 0.9]]
-        )
-        temps.append(t)
-        rgb_pix.append(r)
-    gated, fb = gated_means_per_window_from_samples(
-        rgb_pix, temps, plain, fs=30.0, window_s=1.0, min_roi_frac=0.10
-    )
-    assert gated.shape == (n, 3)
-    assert bool(np.all(fb == fb[0]))
+def _thermal_and_roi():
+    rng = np.random.default_rng(0)
+    thermal = rng.uniform(0, 255, size=(60, 80)).astype(np.float32)
+    roi = np.zeros((120, 160), dtype=bool)
+    roi[20:100, 30:130] = True
+    affine = np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0]])  # termika (x, y) -> RGB (2x, 2y)
+    return thermal, affine, roi
 
 
-def test_consensus_median_affine_and_point_dispersion():
-    from src.extract import affine_point_dispersion_px, consensus_median_affine
+def test_sample_roi_temps_chunked_equals_single_remap(monkeypatch):
+    """Porcjowanie remap nie zmienia wyniku względem jednego wywołania."""
+    thermal, affine, roi = _thermal_and_roi()
+    ys1, xs1, t1 = sample_roi_temps_via_affine(thermal, affine, roi)
+    monkeypatch.setattr(extract, "_REMAP_CHUNK", 777)
+    ys2, xs2, t2 = sample_roi_temps_via_affine(thermal, affine, roi)
+    np.testing.assert_array_equal(ys1, ys2)
+    np.testing.assert_array_equal(xs1, xs2)
+    np.testing.assert_array_equal(t1, t2)
 
-    mats = [
-        np.array([[1.0, 0.0, float(tx)], [0.0, 1.0, 0.0]]) for tx in (0.0, 10.0, 20.0)
-    ]
-    pts = np.array([[100.0, 50.0], [200.0, 50.0], [150.0, 150.0], [120.0, 200.0]])
-    aff, resid = consensus_median_affine(mats, pts)
-    assert aff is not None
-    assert abs(aff[0, 2] - 10.0) < 1.0
-    disp = affine_point_dispersion_px(mats, pts)
-    assert disp["median_abs_dev"] > 0
-    assert disp["iqr_radial"] > 0
+
+def test_sample_roi_temps_maps_through_affine():
+    """Piksel RGB (2x, 2y) dostaje temperaturę termiki z (x, y)."""
+    thermal, affine, roi = _thermal_and_roi()
+    ys, xs, temps = sample_roi_temps_via_affine(thermal, affine, roi)
+    k = int(np.where((ys == 40) & (xs == 60))[0][0])
+    assert temps[k] == pytest.approx(float(thermal[20, 30]), abs=1e-3)
+
+
+def test_sample_roi_temps_empty_roi():
+    thermal, affine, _ = _thermal_and_roi()
+    ys, xs, temps = sample_roi_temps_via_affine(thermal, affine, np.zeros((120, 160), bool))
+    assert ys.size == xs.size == temps.size == 0

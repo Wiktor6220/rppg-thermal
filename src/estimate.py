@@ -2,7 +2,7 @@
 
 import numpy as np
 from scipy import sparse
-from scipy.signal import butter, find_peaks, periodogram, sosfiltfilt, welch
+from scipy.signal import butter, periodogram, sosfiltfilt, welch
 
 from src.config import (
     BAND_HIGH_HZ,
@@ -51,9 +51,8 @@ def estimate_hr_welch(
 ) -> float:
     """HR = argmax PSD Welcha w paśmie; nfft ≥ 2048.
 
-    ``segment_sec=None`` → ``WELCH_SEGMENT_SEC`` z config (często ≈ długość okna
-    walidacji → mało uśredniania). Krótszy ``segment_sec`` + overlap zmniejsza
-    wariancję PSD (opcjonalne A/B).
+    ``segment_sec=None`` -> ``WELCH_SEGMENT_SEC`` z config. Krótszy ``segment_sec``
+    przy tym samym overlap daje więcej segmentów do uśrednienia i mniejszą wariancję PSD.
     """
     signal = np.asarray(signal, dtype=np.float64)
     seg_s = float(WELCH_SEGMENT_SEC if segment_sec is None else segment_sec)
@@ -69,16 +68,6 @@ def estimate_hr_welch(
     return float(freqs[band][np.argmax(psd[band])] * 60.0)
 
 
-def estimate_hr_peaks(signal: np.ndarray, fs: float) -> float:
-    """HR ze średniego odstępu między pikami."""
-    signal = np.asarray(signal, dtype=np.float64)
-    min_distance = max(1, int(round(fs / BAND_HIGH_HZ)))
-    peaks, _ = find_peaks(signal, distance=min_distance)
-    if len(peaks) < 2:
-        raise ValueError("Za mało pików do estymacji HR.")
-    return 60.0 / (np.mean(np.diff(peaks)) / fs)
-
-
 def snr_rppg(
     signal: np.ndarray,
     fs: float,
@@ -86,7 +75,7 @@ def snr_rppg(
     n_harmonics: int = 2,
     bin_width_hz: float = 0.2,
 ) -> float:
-    """SNR [dB]: moc wokół f0…harmonicznych vs reszta pasma HR."""
+    """SNR [dB]: moc wokół f0 i jej harmonicznych vs reszta pasma HR."""
     signal = np.asarray(signal, dtype=np.float64)
     freqs, psd = periodogram(signal, fs=fs)
     band_mask = (freqs >= BAND_LOW_HZ) & (freqs <= BAND_HIGH_HZ)

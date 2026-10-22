@@ -1,4 +1,4 @@
-"""Ekstrakcja śladu RGB z ROI i maskowanie perfuzji z termiki."""
+"""Ekstrakcja śladu RGB z ROI i bramkowanie perfuzją z termiki."""
 
 from __future__ import annotations
 
@@ -8,24 +8,12 @@ import numpy as np
 from src.config import PERFUSION_MIN_ROI_FRAC, PERFUSION_TEMP_STD_FACTOR
 from src.registration import apply_affine
 
-
-def _roi_to_mask(roi_position: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Maska (H,W) lub bbox [y0,x0,y1,x1] → bool (H,W)."""
-    roi_position = np.asarray(roi_position)
-    if roi_position.ndim == 2 and roi_position.shape == (height, width):
-        return roi_position.astype(bool)
-    if roi_position.shape == (4,):
-        y0, x0, y1, x1 = (int(v) for v in roi_position)
-        mask = np.zeros((height, width), dtype=bool)
-        mask[y0:y1, x0:x1] = True
-        return mask
-    raise ValueError(
-        f"ROI: maska ({height},{width}) lub bbox (4,), otrzymano {roi_position.shape}"
-    )
+# OpenCV remap: dst.cols musi być < SHRT_MAX (~32k), więc duże ROI próbkujemy porcjami.
+_REMAP_CHUNK = 16_384
 
 
 def mean_rgb_in_mask(rgb_frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Średnia RGB w masce; pusta maska → średnia całej klatki."""
+    """Średnia RGB w masce; pusta maska -> średnia całej klatki."""
     rgb_frame = np.asarray(rgb_frame, dtype=np.float64)
     mask = np.asarray(mask, dtype=bool)
     if mask.any():
@@ -33,55 +21,12 @@ def mean_rgb_in_mask(rgb_frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return rgb_frame.reshape(-1, rgb_frame.shape[-1]).mean(axis=0).astype(np.float64)
 
 
-def _check_lengths(n_frames: int, roi_positions: list, valid: np.ndarray) -> None:
-    """Sprawdza zgodność długości ROI / valid z liczbą klatek."""
-    if len(roi_positions) != n_frames:
-        raise ValueError("Liczba pozycji ROI ≠ liczba klatek.")
-    if np.asarray(valid).shape[0] != n_frames:
-        raise ValueError("Długość valid[] ≠ liczba klatek.")
-
-
-def extract_rgb_trace(
-    rgb_frames: np.ndarray, roi_positions: list[np.ndarray], valid: np.ndarray
-) -> np.ndarray:
-    """Średnie RGB w ROI na klatkę → (N, 3)."""
-    rgb_frames = np.asarray(rgb_frames, dtype=np.float64)
-    n_frames, height, width, _ = rgb_frames.shape
-    _check_lengths(n_frames, roi_positions, valid)
-
-    trace = np.empty((n_frames, 3), dtype=np.float64)
-    for i in range(n_frames):
-        mask = _roi_to_mask(roi_positions[i], height, width)
-        trace[i] = mean_rgb_in_mask(rgb_frames[i], mask)
-    return trace
-
-
-def compute_perfusion_mask(thermal_frame: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
-    """Piksele ROI powyżej mean + k·std (bez normalizacji per klatka).
-
-    Świadome ograniczenie: źródło to wizualny podgląd MP4 z AGC (nie radiometria).
-    Próg ``mean + k·std`` na względnej jasności w ROI dryfuje między klatkami —
-    tego nie da się „naprawić” bez prawdziwych temperatur; nie zmieniamy heurystyki.
-    """
-    thermal_frame = np.asarray(thermal_frame, dtype=np.float64)
-    roi_mask = np.asarray(roi_mask, dtype=bool)
-    if thermal_frame.shape != roi_mask.shape:
-        raise ValueError("Termika i maska ROI muszą mieć ten sam kształt.")
-
-    roi_values = thermal_frame[roi_mask]
-    if roi_values.size == 0:
-        return np.zeros_like(roi_mask, dtype=bool)
-
-    threshold = roi_values.mean() + PERFUSION_TEMP_STD_FACTOR * roi_values.std()
-    return roi_mask & (thermal_frame >= threshold)
-
-
 def sample_roi_temps_via_affine(
     thermal_gray: np.ndarray,
     affine_th_to_rgb: np.ndarray,
     roi_mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Temperatury termiki w pikselach ROI RGB (odwrotna affine + remap)."""
+    """Temperatury termiki w pikselach ROI RGB (odwrotna affine + remap porcjami)."""
     ys, xs = np.where(np.asarray(roi_mask, dtype=bool))
     if ys.size == 0:
         empty = np.zeros(0, dtype=np.int64)
@@ -100,20 +45,24 @@ def sample_roi_temps_via_affine(
         empty = np.zeros(0, dtype=np.int64)
         return empty, empty, np.zeros(0, dtype=np.float64)
 
-    map_x = pts_th[inside, 0].astype(np.float32).reshape(1, -1)
-    map_y = pts_th[inside, 1].astype(np.float32).reshape(1, -1)
-    temps = (
-        cv2.remap(
-            np.asarray(thermal_gray, dtype=np.float32),
-            map_x,
-            map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+    pts_in = pts_th[inside]
+    th = np.asarray(thermal_gray, dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    for start in range(0, pts_in.shape[0], _REMAP_CHUNK):
+        chunk = pts_in[start : start + _REMAP_CHUNK]
+        map_x = chunk[:, 0].astype(np.float32).reshape(1, -1)
+        map_y = chunk[:, 1].astype(np.float32).reshape(1, -1)
+        chunks.append(
+            cv2.remap(
+                th,
+                map_x,
+                map_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).ravel()
         )
-        .ravel()
-        .astype(np.float64)
-    )
+    temps = np.concatenate(chunks).astype(np.float64)
     return ys[inside], xs[inside], temps
 
 
@@ -124,7 +73,11 @@ def gated_means_per_frame_from_samples(
     temp_std_factor: float = PERFUSION_TEMP_STD_FACTOR,
     min_roi_frac: float = PERFUSION_MIN_ROI_FRAC,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Gated z gotowych próbek per klatka → (means, fallback_flags)."""
+    """Gated z gotowych próbek per klatka -> (means, fallback_flags).
+
+    Próg ``mean + k·std`` liczony na względnej jasności podglądu termiki w ROI
+    (nie temperatura radiometryczna); za mało pikseli powyżej progu -> plain.
+    """
     n = len(plain_means)
     out = np.empty((n, 3), dtype=np.float64)
     fallback = np.zeros(n, dtype=bool)
@@ -143,91 +96,3 @@ def gated_means_per_frame_from_samples(
             out[i] = rp[keep].mean(axis=0)
             fallback[i] = False
     return out, fallback
-
-
-def gated_means_per_window_from_samples(
-    rgb_pixels: list[np.ndarray | None],
-    temps: list[np.ndarray | None],
-    plain_means: np.ndarray,
-    fs: float,
-    window_s: float = 10.0,
-    temp_std_factor: float = PERFUSION_TEMP_STD_FACTOR,
-    min_roi_frac: float = PERFUSION_MIN_ROI_FRAC,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Jeden próg i decyzja gated/fallback na całe okno czasowe."""
-    n = len(plain_means)
-    out = plain_means.copy()
-    fallback = np.ones(n, dtype=bool)
-    win = max(1, int(round(window_s * fs)))
-    start = 0
-    while start < n:
-        end = min(n, start + win)
-        pool_t = [temps[i] for i in range(start, end) if temps[i] is not None and temps[i].size]
-        if not pool_t:
-            start = end
-            continue
-        all_t = np.concatenate(pool_t)
-        thr = float(all_t.mean() + temp_std_factor * all_t.std())
-        use_gated = all_t.size > 0 and int(np.count_nonzero(all_t >= thr)) >= min_roi_frac * all_t.size
-        for i in range(start, end):
-            rp, tp = rgb_pixels[i], temps[i]
-            if not use_gated or rp is None or tp is None or tp.size == 0:
-                out[i] = plain_means[i]
-                fallback[i] = True
-                continue
-            keep = tp >= thr
-            if not np.any(keep):
-                out[i] = plain_means[i]
-                fallback[i] = True
-            else:
-                out[i] = rp[keep].mean(axis=0)
-                fallback[i] = False
-        start = end
-    return out, fallback
-
-
-def affine_point_dispersion_px(
-    matrices: list[np.ndarray],
-    probe_pts_th: np.ndarray,
-) -> dict[str, float]:
-    """Rozrzut stałych punktów termiki zmapowanych do RGB [px]."""
-    if len(matrices) < 2 or probe_pts_th.size == 0:
-        return {"median_abs_dev": 0.0, "iqr_radial": 0.0, "max_median_dev": 0.0}
-
-    mapped = np.stack(
-        [apply_affine(np.asarray(m, dtype=np.float64), probe_pts_th) for m in matrices],
-        axis=0,
-    )
-    med = np.median(mapped, axis=0)
-    radial = np.linalg.norm(mapped - med[None, :, :], axis=2)
-    per_point_mad = np.median(radial, axis=0)
-    return {
-        "median_abs_dev": float(np.median(per_point_mad)),
-        "iqr_radial": float(np.subtract(*np.percentile(radial.ravel(), [75, 25]))),
-        "max_median_dev": float(np.max(per_point_mad)),
-    }
-
-
-def consensus_median_affine(
-    matrices: list[np.ndarray],
-    probe_pts_th: np.ndarray,
-) -> tuple[np.ndarray | None, float]:
-    """Affine z mediany pozycji punktów (nie mediana 6 parametrów)."""
-    if not matrices or probe_pts_th is None or len(probe_pts_th) < 3:
-        return None, float("nan")
-
-    mapped = np.stack(
-        [apply_affine(np.asarray(m, dtype=np.float64), probe_pts_th) for m in matrices],
-        axis=0,
-    )
-    med_xy = np.median(mapped, axis=0)
-    resid = float(np.mean(np.linalg.norm(mapped - med_xy[None, :, :], axis=2)))
-    matrix, _ = cv2.estimateAffine2D(
-        probe_pts_th.astype(np.float32),
-        med_xy.astype(np.float32),
-        method=cv2.RANSAC,
-        ransacReprojThreshold=1e6,
-    )
-    if matrix is None:
-        return None, resid
-    return matrix.astype(np.float64), resid

@@ -14,7 +14,9 @@ from src.pipeline import run_pipeline
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Potok rPPG RGB+termika (DJI) → metryki i figury.")
-    parser.add_argument("--data", type=Path, default=DATA_DIR, help="Katalog z danymi (domyślnie data/)")
+    parser.add_argument(
+        "--data", type=Path, default=DATA_DIR, help="Katalog z danymi (domyślnie data/)"
+    )
     parser.add_argument("--subject", default=None, help="np. subject04 (domyślnie wszyscy)")
     parser.add_argument(
         "--recalibrate",

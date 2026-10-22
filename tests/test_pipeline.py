@@ -32,12 +32,12 @@ def test_scene_quality_uses_median_and_good_fraction():
     q = _scene_registration_quality(
         [40.0, 10.0, 12.0, float("nan")], [0.6, 0.9, 0.8, float("nan")], first, threshold=THR
     )
-    assert q["contour_rms_px"] == 12.0
-    assert np.isclose(q["iou"], 0.8)
-    assert q["rms_first_px"] == 40.0
-    assert q["n_attempts"] == 4
-    assert np.isclose(q["good_frac"], 0.5)
-    assert q["trustworthy"]
+    assert q.contour_rms_px == 12.0
+    assert np.isclose(q.iou, 0.8)
+    assert q.rms_first_px == 40.0
+    assert q.n_attempts == 4
+    assert np.isclose(q.good_frac, 0.5)
+    assert q.trustworthy
 
 
 def test_ref_suspect_comes_from_config(monkeypatch):

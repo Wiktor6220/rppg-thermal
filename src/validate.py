@@ -1,47 +1,11 @@
-"""Walidacja HR w przesuwanych oknach: MAE, RMSE, SNR."""
+"""Walidacja HR w 4 równych oknach vs Polar: MAE, RMSE, SNR, błędy oktawowe."""
 
 from collections.abc import Callable
 
 import numpy as np
 
-from src.config import (
-    MIN_VALID_RATIO,
-    N_QUARTER_WINDOWS,
-    VALIDATION_STEP_SEC,
-    VALIDATION_WINDOW_SEC,
-)
-from src.estimate import (
-    bandpass_filter,
-    detrend_signal,
-    estimate_hr_peaks,
-    estimate_hr_welch,
-    snr_rppg,
-)
-
-
-def _window_bounds(
-    n_samples: int, fs: float, window_s: float, step_s: float
-) -> list[tuple[int, int]]:
-    """Indeksy (start, end) kolejnych okien."""
-    window_len = int(round(window_s * fs))
-    step_len = int(round(step_s * fs))
-    if window_len <= 0 or step_len <= 0:
-        raise ValueError("window_s i step_s muszą być dodatnie.")
-
-    bounds = []
-    start = 0
-    while start + window_len <= n_samples:
-        bounds.append((start, start + window_len))
-        start += step_len
-    return bounds
-
-
-def split_into_windows(
-    signal: np.ndarray, fs: float, window_s: float, step_s: float
-) -> list[np.ndarray]:
-    """Dzieli sygnał na przesuwane okna."""
-    signal = np.asarray(signal, dtype=np.float64)
-    return [signal[s:e] for s, e in _window_bounds(signal.shape[0], fs, window_s, step_s)]
+from src.config import MIN_VALID_RATIO, N_QUARTER_WINDOWS
+from src.estimate import bandpass_filter, detrend_signal, estimate_hr_welch, snr_rppg
 
 
 def compute_mae(estimated: np.ndarray, reference: np.ndarray) -> float:
@@ -95,60 +59,6 @@ def _estimate_window_hr(
         return float(hr_estimator(cleaned, fs))
     except (ValueError, np.linalg.LinAlgError):
         return float("nan")
-
-
-def validate_signal(
-    estimated_signal: np.ndarray,
-    reference_signal: np.ndarray,
-    fs: float,
-    valid: np.ndarray | None = None,
-    window_s: float = VALIDATION_WINDOW_SEC,
-    step_s: float = VALIDATION_STEP_SEC,
-    min_valid_ratio: float = MIN_VALID_RATIO,
-    hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
-    reference_hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_peaks,
-) -> dict:
-    """Porównuje dwa sygnały czasowe oknami; niski valid[] → pominięcie okna."""
-    estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
-    reference_signal = np.asarray(reference_signal, dtype=np.float64)
-    if estimated_signal.shape[0] != reference_signal.shape[0]:
-        raise ValueError("Sygnały muszą mieć tę samą długość.")
-    n_samples = estimated_signal.shape[0]
-
-    if valid is None:
-        valid = np.ones(n_samples, dtype=bool)
-    valid = np.asarray(valid, dtype=bool)
-    if valid.shape[0] != n_samples:
-        raise ValueError("valid[] musi mieć długość sygnału.")
-
-    bounds = _window_bounds(n_samples, fs, window_s, step_s)
-    n_windows = len(bounds)
-    window_start_s = np.array([start / fs for start, _ in bounds])
-    estimated_hr_bpm = np.full(n_windows, np.nan)
-    reference_hr_bpm = np.full(n_windows, np.nan)
-    window_used = np.zeros(n_windows, dtype=bool)
-
-    for i, (start, end) in enumerate(bounds):
-        if _window_valid_ratio(valid, start, end) < min_valid_ratio:
-            continue
-        est_hr = _estimate_window_hr(estimated_signal[start:end], fs, hr_estimator)
-        ref_hr = _estimate_window_hr(reference_signal[start:end], fs, reference_hr_estimator)
-        estimated_hr_bpm[i] = est_hr
-        reference_hr_bpm[i] = ref_hr
-        window_used[i] = not (np.isnan(est_hr) or np.isnan(ref_hr))
-
-    metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
-    return {
-        "window_start_s": window_start_s,
-        "estimated_hr_bpm": estimated_hr_bpm,
-        "reference_hr_bpm": reference_hr_bpm,
-        "error_bpm": np.abs(estimated_hr_bpm - reference_hr_bpm),
-        "window_used": window_used,
-        "n_windows_total": n_windows,
-        "n_windows_used": metrics["n_windows_used"],
-        "mae_bpm": metrics["mae_bpm"],
-        "rmse_bpm": metrics["rmse_bpm"],
-    }
 
 
 def usable_video_hr_range(
@@ -215,7 +125,7 @@ def validate_against_hr_quarters(
     if valid.shape[0] != n_samples:
         raise ValueError("valid[] musi mieć długość sygnału.")
 
-    # Info o pokryciu HR∩wideo (nie wyznacza granic okien).
+    # Info o pokryciu HR i wideo (nie wyznacza granic okien).
     t_lo, t_hi = usable_video_hr_range(ref_t_s, video_duration_s)
 
     frame_bounds = quarter_frame_bounds(n_samples)
@@ -270,88 +180,12 @@ def validate_against_hr_quarters(
     }
 
 
-def validate_against_hr_series(
-    estimated_signal: np.ndarray,
-    fs: float,
-    ref_t_s: np.ndarray,
-    ref_hr_bpm: np.ndarray,
-    valid: np.ndarray | None = None,
-    window_s: float = VALIDATION_WINDOW_SEC,
-    step_s: float = VALIDATION_STEP_SEC,
-    min_valid_ratio: float = MIN_VALID_RATIO,
-    hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
-) -> dict:
-    """Walidacja vs seria Polar HR: Welch + mediana ref w oknie; SNR względem ref.
-
-    ``ref_t_s`` to czas [s] od startu wideo (klatka 0). Przy synchronizacji absolutnej
-    (creation_time MP4 ↔ Polar) wartości mogą być ujemne przed startem nagrania —
-    okna filtrują po ``[start/fs, end/fs)`` jak wcześniej (bez zerowania do pierwszej próbki).
-    """
-    estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
-    ref_t_s = np.asarray(ref_t_s, dtype=np.float64)
-    ref_hr_bpm = np.asarray(ref_hr_bpm, dtype=np.float64)
-    n_samples = estimated_signal.shape[0]
-
-    if valid is None:
-        valid = np.ones(n_samples, dtype=bool)
-    valid = np.asarray(valid, dtype=bool)
-    if valid.shape[0] != n_samples:
-        raise ValueError("valid[] musi mieć długość sygnału.")
-
-    bounds = _window_bounds(n_samples, fs, window_s, step_s)
-    n_windows = len(bounds)
-    window_start_s = np.array([start / fs for start, _ in bounds])
-    estimated_hr_bpm = np.full(n_windows, np.nan)
-    reference_hr_bpm = np.full(n_windows, np.nan)
-    snr_db = np.full(n_windows, np.nan)
-    window_used = np.zeros(n_windows, dtype=bool)
-
-    for i, (start, end) in enumerate(bounds):
-        if _window_valid_ratio(valid, start, end) < min_valid_ratio:
-            continue
-        t0, t1 = start / fs, end / fs
-        in_win = (ref_t_s >= t0) & (ref_t_s < t1)
-        if not np.any(in_win):
-            continue
-
-        ref_hr = float(np.median(ref_hr_bpm[in_win]))
-        window_sig = estimated_signal[start:end]
-        est_hr = _estimate_window_hr(window_sig, fs, hr_estimator)
-        try:
-            cleaned = bandpass_filter(detrend_signal(window_sig), fs)
-            snr_val = float(snr_rppg(cleaned, fs, ref_hr))
-        except (ValueError, np.linalg.LinAlgError):
-            snr_val = float("nan")
-
-        estimated_hr_bpm[i] = est_hr
-        reference_hr_bpm[i] = ref_hr
-        snr_db[i] = snr_val
-        window_used[i] = not np.isnan(est_hr)
-
-    metrics = validate_windows(estimated_hr_bpm, reference_hr_bpm)
-    snr_used = snr_db[window_used & np.isfinite(snr_db)]
-    return {
-        "window_start_s": window_start_s,
-        "estimated_hr_bpm": estimated_hr_bpm,
-        "reference_hr_bpm": reference_hr_bpm,
-        "error_bpm": np.abs(estimated_hr_bpm - reference_hr_bpm),
-        "snr_db": snr_db,
-        "snr_mean": float(np.mean(snr_used)) if snr_used.size else float("nan"),
-        "octave_error_frac": float(octave_error_fraction(estimated_hr_bpm, reference_hr_bpm)),
-        "window_used": window_used,
-        "n_windows_total": n_windows,
-        "n_windows_used": metrics["n_windows_used"],
-        "mae_bpm": metrics["mae_bpm"],
-        "rmse_bpm": metrics["rmse_bpm"],
-    }
-
-
 def octave_error_fraction(
     estimated_hr: np.ndarray,
     reference_hr: np.ndarray,
     rel_tol: float = 0.15,
 ) -> float:
-    """Odsetek okien z estymatą ≈ 2× lub ½× referencji."""
+    """Odsetek okien z estymatą bliską 2× lub ½× referencji."""
     est = np.asarray(estimated_hr, dtype=np.float64)
     ref = np.asarray(reference_hr, dtype=np.float64)
     ok = np.isfinite(est) & np.isfinite(ref) & (ref > 0)

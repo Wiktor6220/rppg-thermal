@@ -1,32 +1,23 @@
-# Dane i artefakty lokalne (duże / niepubliczne)
+# Dane, metadane uczestników i wyniki — tylko lokalnie
 data/
-demo_data/
-demo_results/
+metadata/
 results/
-models/
-.venv/
-.claude/
 
-# Cache / śmieci
+# Środowisko i cache
+.venv/
 __pycache__/
 *.py[cod]
-*$py.class
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.ipynb_checkpoints/
 .DS_Store
-Thumbs.db
 
-report.md
+# Pliki robocze agenta
+.claude/
 CLAUDE.md
 CONTEXT.md
-.claude/
 
-notebooks/
-
-generate_results.py
-generate_tests_report.py
-
+#stare pliki
+demo_data/
+demo_results/
 dataold/
-metadata/

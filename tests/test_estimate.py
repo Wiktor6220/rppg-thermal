@@ -1,4 +1,4 @@
-"""Testy potoku estymacji HR: detrend, filtracja pasmowa, Welch i find_peaks."""
+"""Testy potoku estymacji HR: detrend, filtracja pasmowa, Welch, SNR."""
 
 import numpy as np
 import pytest
@@ -6,7 +6,6 @@ import pytest
 from src.estimate import (
     bandpass_filter,
     detrend_signal,
-    estimate_hr_peaks,
     estimate_hr_welch,
     snr_rppg,
 )
@@ -37,18 +36,10 @@ def cleaned_pulse():
     return bandpass_filter(detrend_signal(raw), FS_TEST)
 
 
-@pytest.mark.parametrize("estimator", [estimate_hr_welch, estimate_hr_peaks])
-def test_estimator_recovers_known_hr(cleaned_pulse, estimator):
-    """Welch i find_peaks odzyskują zadane HR w granicach tolerancji."""
-    hr_bpm = estimator(cleaned_pulse, FS_TEST)
+def test_welch_recovers_known_hr(cleaned_pulse):
+    """Welch odzyskuje zadane HR w granicach tolerancji."""
+    hr_bpm = estimate_hr_welch(cleaned_pulse, FS_TEST)
     assert abs(hr_bpm - TRUE_HR_BPM) <= TOLERANCE_BPM
-
-
-def test_welch_and_peaks_agree(cleaned_pulse):
-    """Obie metody estymacji zgadzają się ze sobą w granicach tolerancji."""
-    hr_welch = estimate_hr_welch(cleaned_pulse, FS_TEST)
-    hr_peaks = estimate_hr_peaks(cleaned_pulse, FS_TEST)
-    assert abs(hr_welch - hr_peaks) <= TOLERANCE_BPM
 
 
 def test_detrend_removes_slow_trend():
@@ -57,13 +48,6 @@ def test_detrend_removes_slow_trend():
     detrended = detrend_signal(raw)
     assert abs(detrended.mean()) < abs(raw.mean())
     assert detrended.shape == raw.shape
-
-
-def test_estimate_hr_peaks_raises_on_flat_signal():
-    """Sygnał płaski: find_peaks nie znajduje pików -> ValueError."""
-    flat = np.zeros(int(FS_TEST * 30))
-    with pytest.raises(ValueError):
-        estimate_hr_peaks(flat, FS_TEST)
 
 
 def test_snr_high_for_pure_sine_at_ref_hr():
@@ -91,7 +75,7 @@ def test_welch_argmax_recovers_high_hr_under_pink_noise(true_hr):
     rng = np.random.default_rng(42)
     n_trials = 40
     ok = 0
-    for i in range(n_trials):
+    for _ in range(n_trials):
         pulse = np.sin(2 * np.pi * (true_hr / 60.0) * t)
         noise = _pink_noise(n, np.random.default_rng(rng.integers(0, 2**31 - 1)))
         sig = pulse + 0.8 * noise

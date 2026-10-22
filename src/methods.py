@@ -72,6 +72,9 @@ def pos(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
     return signal
 
 
+PIPELINE_METHODS = {"POS": pos, "CHROM": chrom}  # metody liczone w potoku (kolejność = raport)
+
+
 def ica_method(rgb_trace: np.ndarray, fs: float) -> np.ndarray:
     """ICA na 3 kanałach; wybór składowej z max. mocą w paśmie HR."""
     rgb_trace = _validate_rgb_trace(rgb_trace)

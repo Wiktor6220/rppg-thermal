@@ -1,9 +1,9 @@
-"""Detekcja twarzy (MediaPipe), ROI i śledzenie między klatkami (hold + valid[])."""
+"""Detekcja twarzy (MediaPipe FaceLandmarker na wycinku) i ROI bbox z landmarków."""
 
-from collections.abc import Callable, Iterable
-from contextlib import contextmanager
 import os
 import sys
+from collections.abc import Callable
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -43,6 +43,8 @@ def _get_face_landmarker():
                 f"Brak modelu FaceLandmarker: {FACE_LANDMARKER_MODEL_PATH}"
             )
         _quiet_native_logs()
+        # Leniwy import: mediapipe ładuje natywne biblioteki i loguje na stderr,
+        # więc wczytujemy go dopiero po wyciszeniu logów i tylko gdy detektor jest potrzebny.
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
 
@@ -133,48 +135,3 @@ def roi_mask_from_landmarks(
     mask = np.zeros((height, width), dtype=bool)
     mask[y0:y1, x0:x1] = True
     return mask
-
-
-def _fill_missing_roi(
-    raw_roi: list[np.ndarray | None], valid: np.ndarray
-) -> list[np.ndarray | None]:
-    """Hold-last; luki wiodące — pierwsza znana pozycja."""
-    n = len(raw_roi)
-    filled: list[np.ndarray | None] = list(raw_roi)
-
-    last_known: np.ndarray | None = None
-    for i in range(n):
-        if valid[i]:
-            last_known = raw_roi[i]
-        elif last_known is not None:
-            filled[i] = last_known
-
-    first_known = next((raw_roi[i] for i in range(n) if valid[i]), None)
-    if first_known is not None:
-        for i in range(n):
-            if filled[i] is None:
-                filled[i] = first_known
-    return filled
-
-
-def track_roi_across_frames(
-    frames: Iterable[np.ndarray],
-    detector: Callable[[np.ndarray], np.ndarray | None] = detect_face_landmarks,
-    roi_builder: Callable[[np.ndarray, str], np.ndarray] = select_roi_from_landmarks,
-    region: str = "forehead",
-) -> tuple[list[np.ndarray | None], np.ndarray]:
-    """ROI per klatka z hold-last; valid True tylko przy detekcji."""
-    raw_roi: list[np.ndarray | None] = []
-    valid_list: list[bool] = []
-    for frame in frames:
-        landmarks = detector(frame)
-        if landmarks is not None:
-            raw_roi.append(roi_builder(landmarks, region))
-            valid_list.append(True)
-        else:
-            raw_roi.append(None)
-            valid_list.append(False)
-
-    valid = np.array(valid_list, dtype=bool)
-    roi_positions = _fill_missing_roi(raw_roi, valid)
-    return roi_positions, valid

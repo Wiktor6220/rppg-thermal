@@ -6,7 +6,6 @@ from src.registration import (
     affine_from_contours,
     affine_from_mask_moments,
     apply_affine,
-    compose_affine,
     contour_sample_points,
     rgb_face_mask,
     warp_thermal_to_rgb,
@@ -30,11 +29,10 @@ def _ellipse_mask(shape, center, axes, angle_deg=0.0) -> np.ndarray:
     return mask.astype(bool)
 
 
-def test_compose_and_apply_affine_identity():
+def test_apply_affine_identity():
     eye = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     pts = np.array([[10.0, 20.0], [3.0, 4.0]])
     assert np.allclose(apply_affine(eye, pts), pts)
-    assert np.allclose(compose_affine(eye, eye), eye)
 
 
 def test_moments_recover_similarity():
@@ -95,7 +93,7 @@ def test_refine_affine_eye_y_shifts_ty():
     landmarks = np.zeros((300, 2), dtype=np.float64)
     landmarks[33] = [100.0, 200.0]
     landmarks[263] = [140.0, 200.0]
-    # Affine identity: thermal (40,50) → (40,50); RGB eye y=200 → dy=+150
+    # Affine identity: thermal (40,50) -> (40,50); RGB eye y=200 -> dy=+150
     eye = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     refined, info = refine_affine_eye_y(eye, gray, mask, landmarks)
     assert info is not None
@@ -112,7 +110,7 @@ def test_warp_thermal_to_rgb_shape():
 
 
 def test_cut_neck_pinch_removes_shoulders():
-    """Profil głowa→szyja→barki: cięcie w przewężeniu, nie poniżej najszerszego (barków)."""
+    """Profil głowa -> szyja -> barki: cięcie w przewężeniu, nie poniżej najszerszego (barków)."""
     from src.registration import _cut_neck_width_profile
 
     h, w = 200, 120
@@ -131,7 +129,7 @@ def test_cut_neck_pinch_removes_shoulders():
     assert 75 <= info["cut_row"] <= 105
     assert out[50, 60] == 1  # głowa zostaje
     assert out[150, 60] == 0  # barki odcięte
-    # najszerszy wiersz to barki — stary algorytm tnąc „poniżej widest” zostawiłby barki
+    # najszerszy wiersz to barki — cięcie „poniżej najszerszego wiersza” zostawiłoby barki
     assert int(comp.sum(axis=1).argmax()) >= 100
 
 
@@ -142,7 +140,7 @@ def test_constrain_thermal_mask_to_rgb_face():
     th[10:90, 10:70] = True  # duży blob
     rgb = np.zeros((200, 160), dtype=bool)
     rgb[40:120, 40:100] = True
-    # scale 2, offset 0: th (x,y) → rgb (2x, 2y)
+    # scale 2, offset 0: th (x,y) -> rgb (2x, 2y)
     affine = np.array([[2.0, 0.0, 0.0], [0.0, 2.0, 0.0]], dtype=np.float64)
     constrained = constrain_thermal_mask_to_rgb_face(th, rgb, affine)
     assert constrained.any()

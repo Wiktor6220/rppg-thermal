@@ -41,7 +41,7 @@ results/pipeline/
     ├── fig_thermal_seg.png   # segment twarzy w termice + maska perfuzji
     ├── fig_overlay_reg.png   # termika nałożona na RGB po rejestracji
     ├── fig_hr_windows.png    # HR w 4 równych oknach (czoło/policzki × POS/CHROM) + fragment fali
-    ├── fig_spectrum.png      # widmo Welcha (czoło)
+    ├── fig_spectrum.png      # widmo Welcha (czoło/policzki × POS/CHROM)
     ├── run_stderr.log        # natywne logi MediaPipe z przebiegu
     └── calib_stderr.log      # natywne logi z kalibracji
 ```
@@ -51,5 +51,20 @@ badanego, a agregat dalej zawiera pozostałych.
 
 ## Struktura kodu
 
-`src/config.py → io_layer → roi → registration → extract → methods → estimate → validate → pipeline`.
+| Moduł | Zawartość |
+|---|---|
+| `src/config.py` | wszystkie stałe (pasmo, progi, refresh affine per scena, regiony, ścieżki) |
+| `src/io_layer.py` | metadane wideo, pary klatek RGB/termika po czasie, Polar HR.csv + sync `creation_time` |
+| `src/roi.py` | MediaPipe FaceLandmarker na wycinku, ROI bbox z landmarków |
+| `src/registration.py` | affine termika→RGB z konturów masek, jakość rejestracji, kalibracja nominalna |
+| `src/extract.py` | średnie RGB w ROI, próbki termiki przez affine, bramkowanie perfuzją |
+| `src/methods.py` | GREEN, CHROM, POS, ICA (sygnał→sygnał) |
+| `src/estimate.py` | detrend, bandpass, HR z Welcha, SNR |
+| `src/validate.py` | 4 równe okna, MAE/RMSE, błędy oktawowe |
+| `src/pipeline.py` | sesje w `data/`, kalibracja per scena, przebieg po klatkach, metryki, `run_pipeline` |
+| `src/figures.py` | wszystkie `fig_*.png` sceny |
+| `src/report.py` | `metrics.csv`/`metrics.md`, agregat `all_subjects.csv` + `summary.md` |
+
 `run.py` to cienkie CLI nad `src.pipeline.run_pipeline`; sam nic nie liczy.
+`scripts/check_data.py` — raport spójności plików w `data/`.
+Testy (`tests/`) działają wyłącznie na danych syntetycznych, bez `data/`.

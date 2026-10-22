@@ -12,25 +12,22 @@ BUTTERWORTH_ORDER: int = 3
 WELCH_SEGMENT_SEC: float = 10.0
 
 # --- Eval ---
-EVAL_SUBJECT: str = "subject02"
-# Badani z nietypowo wysokim HR referencji (Polar do ~190 BPM): zostają w tabelach,
+# Badani z nietypowo wysokim HR referencji: zostają w tabelach,
 # werdykt w summary.md liczy statystyki bez nich.
 REF_SUSPECT_SUBJECTS: tuple[str, ...] = ("subject03",)
-VALIDATION_WINDOW_SEC: float = 10.0
-VALIDATION_STEP_SEC: float = 5.0
 MIN_VALID_RATIO: float = 0.5  # min. udział valid[] w oknie
 # 4 równe okna (n//4 klatek; ostatnie bierze resztę)
 N_QUARTER_WINDOWS: int = 4
 
 # --- Maska perfuzji ---
 PERFUSION_TEMP_STD_FACTOR: float = 0.5  # próg: mean + k*std w ROI
-PERFUSION_MIN_ROI_FRAC: float = 0.10  # poniżej → fallback do pełnego ROI
+PERFUSION_MIN_ROI_FRAC: float = 0.10  # poniżej -> fallback do pełnego ROI
 
 # --- Polar HR.csv ---
 POLAR_HR_COLUMN: int = 3  # 0-based; kolumna BPM
 POLAR_HR_SKIP_SAMPLES: int = 0
 
-# --- Affine refresh [klatki]; klucz = nazwa sceny, brak klucza → DEFAULT ---
+# --- Affine refresh [klatki]; klucz = nazwa sceny, brak klucza -> DEFAULT ---
 AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s1_rest_rest": 30,
     "s2_person_move": 30,
@@ -59,6 +56,11 @@ RESULTS_DIR: Path = ROOT_DIR / "results"
 PIPELINE_RESULTS_DIR: Path = RESULTS_DIR / "pipeline"  # domyślne --out w run.py
 MODELS_DIR: Path = ROOT_DIR / "models"
 FACE_LANDMARKER_MODEL_PATH: Path = MODELS_DIR / "face_landmarker.task"
+
+# Regiony: ekstrakcja per ROI, raport (policzki = średnia lewego i prawego)
+REGIONS_EXTRACT: tuple[str, ...] = ("forehead", "left_cheek", "right_cheek")
+REGIONS_REPORT: tuple[str, ...] = ("forehead", "cheeks")
+REGION_LABELS: dict[str, str] = {"forehead": "czoło", "cheeks": "policzki"}
 
 # MediaPipe Face Mesh — indeksy ROI (468 punktów)
 FACE_MESH_LANDMARK_INDICES: dict[str, list[int]] = {

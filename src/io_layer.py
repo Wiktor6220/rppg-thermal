@@ -1,26 +1,18 @@
-"""Wczytywanie nagrań RGB + termika (podgląd mp4), metadane i generatory klatek."""
+"""Wczytywanie nagrań RGB + termika (podgląd mp4), metadane, generatory klatek, Polar HR."""
 
+import csv
 import math
-import re
+import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
 
-from src.config import (
-    DATA_DIR,
-    EVAL_SUBJECT,
-    POLAR_HR_COLUMN,
-    POLAR_HR_SKIP_SAMPLES,
-)
-
-# Konwencja nazw w folderze sesji
-_RGB_SUFFIX = "rgb"
-_THERMAL_SUFFIX = "thermal"
-_VIDEO_EXT = ".mp4"
-_SESSION_RE = re.compile(r"^s\d+", re.IGNORECASE)
+from src.config import POLAR_HR_COLUMN, POLAR_HR_SKIP_SAMPLES
 
 
 @dataclass(frozen=True)
@@ -53,28 +45,14 @@ class Recording:
     rgb_path: Path
     thermal_path: Path
 
-    @property
-    def scenario_code(self) -> str:
-        """Kod sesji sN (np. s1 z s1_rest_rest)."""
-        match = _SESSION_RE.match(self.scenario)
-        return match.group(0).lower() if match else self.scenario
-
 
 @dataclass(frozen=True)
 class LoadedRecording:
-    """Nagranie z metadanymi i generatorami klatek."""
+    """Nagranie z metadanymi obu strumieni."""
 
     recording: Recording
     rgb_meta: VideoMeta
     thermal_meta: VideoMeta
-
-    def rgb_frames(self, to_rgb: bool = True) -> Iterator[np.ndarray]:
-        """Generator klatek strumienia RGB (H, W, 3), uint8."""
-        return iter_video_frames(self.recording.rgb_path, to_rgb=to_rgb)
-
-    def thermal_frames(self, to_rgb: bool = True) -> Iterator[np.ndarray]:
-        """Generator klatek strumienia termicznego (podgląd wizualny) (H, W, 3), uint8."""
-        return iter_video_frames(self.recording.thermal_path, to_rgb=to_rgb)
 
     def synced_pairs(
         self,
@@ -90,84 +68,6 @@ class LoadedRecording:
         return iter_time_synced_pairs(
             self, reference=reference, match_resolution=match_resolution, to_rgb=to_rgb
         )
-
-
-def _find_stream(session_dir: Path, suffix: str) -> Path | None:
-    """Plik wideo ``*_suffix.mp4`` w folderze sesji (case-insensitive).
-
-    Aliasy DJI: RGB/V → rgb, T → thermal (podgląd).
-    """
-    aliases = {
-        _RGB_SUFFIX: (_RGB_SUFFIX, "v"),
-        _THERMAL_SUFFIX: (_THERMAL_SUFFIX, "t"),
-    }
-    want = aliases.get(suffix.lower(), (suffix.lower(),))
-    for path in sorted(session_dir.iterdir()):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() != _VIDEO_EXT:
-            continue
-        stem = path.stem.lower()
-        if any(stem.endswith(f"_{a}") for a in want):
-            return path
-    return None
-
-
-def list_recordings(
-    data_dir: Path = DATA_DIR,
-    subject: str | None = None,
-) -> list[Recording]:
-    """Nagrania RGB+termika w data/; opcjonalnie filtr po subject."""
-    recordings: list[Recording] = []
-    if not data_dir.is_dir():
-        return recordings
-
-    want = _normalize_subject(subject) if subject else None
-    for subject_dir in sorted(data_dir.iterdir()):
-        if not subject_dir.is_dir() or not subject_dir.name.startswith("subject"):
-            continue
-        if want is not None and subject_dir.name != want:
-            continue
-        for session_dir in sorted(subject_dir.iterdir()):
-            if not session_dir.is_dir() or not _SESSION_RE.match(session_dir.name):
-                continue
-            rgb_path = _find_stream(session_dir, _RGB_SUFFIX)
-            thermal_path = _find_stream(session_dir, _THERMAL_SUFFIX)
-            if rgb_path is not None and thermal_path is not None:
-                recordings.append(
-                    Recording(subject_dir.name, session_dir.name, rgb_path, thermal_path)
-                )
-    return recordings
-
-
-def list_eval_recordings(data_dir: Path = DATA_DIR) -> list[Recording]:
-    """Nagrania EVAL_SUBJECT (subject02)."""
-    return list_recordings(data_dir, subject=EVAL_SUBJECT)
-
-
-def _normalize_subject(subject: str) -> str:
-    """Normalizuje id osoby do subjectXX."""
-    value = subject.strip()
-    if value.lower().startswith("subject"):
-        return value
-    if value.isdigit():
-        return f"subject{int(value):02d}"
-    return value
-
-
-def find_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Recording:
-    """Znajduje kompletne nagranie dla danej osoby i scenariusza."""
-    subj = _normalize_subject(subject).lower()
-    scen = scenario.strip().lower()
-    for rec in list_recordings(data_dir):
-        if rec.subject.lower() != subj:
-            continue
-        scenario_lower = rec.scenario.lower()
-        if scen in (scenario_lower, rec.scenario_code.lower()) or scenario_lower.startswith(scen):
-            return rec
-    raise FileNotFoundError(
-        f"Nie znaleziono kompletnego nagrania: subject={subject!r}, scenario={scenario!r}"
-    )
 
 
 def probe_video(path: Path) -> VideoMeta:
@@ -203,23 +103,13 @@ def iter_video_frames(path: Path, to_rgb: bool = True) -> Iterator[np.ndarray]:
         cap.release()
 
 
-def load_recording(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> LoadedRecording:
-    """Metadane obu strumieni + generatory klatek (bez pełnego wczytania do RAM)."""
-    rec = find_recording(subject, scenario, data_dir)
-    return LoadedRecording(
-        recording=rec,
-        rgb_meta=probe_video(rec.rgb_path),
-        thermal_meta=probe_video(rec.thermal_path),
-    )
-
-
 def resize_to(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     """cv2.resize do (width, height); to nie jest korejestracja geometryczna."""
     target_w, target_h = size
     src_h, src_w = frame.shape[:2]
     if (src_w, src_h) == (target_w, target_h):
         return frame
-    # Zmniejszanie → INTER_AREA (mniej aliasingu); powiększanie → INTER_LINEAR.
+    # Zmniejszanie -> INTER_AREA (mniej aliasingu); powiększanie -> INTER_LINEAR.
     interpolation = cv2.INTER_AREA if target_w * target_h < src_w * src_h else cv2.INTER_LINEAR
     return cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
 
@@ -268,9 +158,9 @@ def iter_time_synced_pairs(
                 rgb_frame, thermal_frame = current_other, ref_frame
 
             if match_resolution == "rgb":
-                thermal_frame = resize_to(thermal_frame, target_size)  # termika → rozmiar RGB
+                thermal_frame = resize_to(thermal_frame, target_size)  # termika -> rozmiar RGB
             elif match_resolution == "thermal":
-                rgb_frame = resize_to(rgb_frame, target_size)  # RGB → rozmiar termiki
+                rgb_frame = resize_to(rgb_frame, target_size)  # RGB -> rozmiar termiki
 
             yield rgb_frame, thermal_frame, t_ref
     finally:
@@ -307,35 +197,12 @@ class PolarHrSeries:
     t_s: np.ndarray  # [s] od startu wideo (może być ujemne przed startem)
     hr_bpm: np.ndarray
     sync_mode: str = "relative_zero"  # "absolute_utc" | "relative_zero"
-    sync_offset_s: float = float("nan")  # start_wideo − start_HR [s]
+    sync_offset_s: float = float("nan")  # start_wideo - start_HR [s]
     sync_note: str = ""
 
 
-def find_polar_hr_path(subject: str, scenario: str, data_dir: Path = DATA_DIR) -> Path | None:
-    """Zwraca ścieżkę do ``*_HR.csv`` w folderze sesji albo None, gdy brak pliku."""
-    try:
-        session_dir = find_recording(subject, scenario, data_dir).rgb_path.parent
-    except FileNotFoundError:
-        # Sesja bez pary RGB+termika — szukaj HR po ścieżce katalogu.
-        subj = _normalize_subject(subject)
-        session_dir = data_dir / subj / scenario
-        if not session_dir.is_dir():
-            return None
-    matches = (
-        sorted(session_dir.glob("*_HR.csv"))
-        + sorted(session_dir.glob("*HR.csv"))
-        + sorted(session_dir.glob("dataHR_*.csv"))
-    )
-    # Unikaj duplikatów przy pokrywających się globach.
-    unique = list(dict.fromkeys(matches))
-    return unique[0] if unique else None
-
-
-def probe_mp4_creation_time_utc(path: Path) -> "datetime | None":
+def probe_mp4_creation_time_utc(path: Path) -> datetime | None:
     """Odczytuje ``creation_time`` z tagów MP4 przez ffprobe (UTC). NIE używa mtime."""
-    import subprocess
-    from datetime import datetime, timezone
-
     try:
         proc = subprocess.run(
             [
@@ -361,19 +228,17 @@ def probe_mp4_creation_time_utc(path: Path) -> "datetime | None":
     # np. 2026-10-10T08:26:32.000000Z
     try:
         if raw.endswith("Z"):
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
         dt = datetime.fromisoformat(raw)
         if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except ValueError:
         return None
 
 
-def _parse_polar_hr_header_local(header: list[str]):
-    """Nagłówek ``TIMESTAMP,DD,MM,YYYY,HH,MM,SS,us`` → datetime lokalny (naive) lub None."""
-    from datetime import datetime
-
+def _parse_polar_hr_header_local(header: list[str]) -> datetime | None:
+    """Nagłówek ``TIMESTAMP,DD,MM,YYYY,HH,MM,SS,us`` -> datetime lokalny (naive) lub None."""
     if len(header) < 8 or header[0].strip().upper() != "TIMESTAMP":
         return None
     try:
@@ -383,7 +248,7 @@ def _parse_polar_hr_header_local(header: list[str]):
         if us < 1_000_000:
             micro = us
         elif us < 1_000_000_000:
-            micro = us // 1000  # nanosekundy → µs (przybliżenie)
+            micro = us // 1000  # nanosekundy -> µs (przybliżenie)
         else:
             micro = us % 1_000_000
         return datetime(year, month, day, hour, minute, sec, micro)
@@ -417,6 +282,101 @@ def hr_video_time_overlap_ok(
     return True, f"overlap={overlap:.1f} s"
 
 
+def _relative_zero_series(
+    times_clock: list[datetime],
+    hrs_arr: np.ndarray,
+    sync_offset_s: float,
+    note: str,
+) -> PolarHrSeries:
+    """Seria z osią czasu od pierwszej próbki HR (t_s[0] = 0)."""
+    t0 = times_clock[0]
+    t_s = np.array([(t - t0).total_seconds() for t in times_clock], dtype=np.float64)
+    return PolarHrSeries(
+        t_s=t_s,
+        hr_bpm=hrs_arr,
+        sync_mode="relative_zero",
+        sync_offset_s=sync_offset_s,
+        sync_note=note,
+    )
+
+
+def _local_sample_times(
+    header_local: datetime, times_clock: list[datetime], tz: tzinfo
+) -> list[datetime]:
+    """Absolutny czas lokalny każdej próbki: data z nagłówka + godzina z wiersza.
+
+    Rollover po północy: gdy godzina próbki jest mniejsza niż poprzedniej, dzień + 1.
+    """
+    base_date = header_local.date()
+    abs_local: list[datetime] = []
+    day_offset = 0
+    prev_tod = None
+    for tc in times_clock:
+        tod = tc.time()
+        if prev_tod is not None and tod < prev_tod:
+            day_offset += 1
+        prev_tod = tod
+        d = base_date + timedelta(days=day_offset)
+        naive = datetime.combine(d, tod)
+        abs_local.append(naive.replace(tzinfo=tz))
+    return abs_local
+
+
+def _absolute_utc_series(
+    path: Path,
+    header_local: datetime | None,
+    times_clock: list[datetime],
+    hrs_arr: np.ndarray,
+    video_path: Path,
+    video_duration_s: float | None,
+) -> PolarHrSeries:
+    """t_s = t_abs_HR_UTC - creation_time_wideo_UTC; przy braku danych relative_zero."""
+    video_utc = probe_mp4_creation_time_utc(video_path)
+    if video_utc is None or header_local is None:
+        reason = "brak creation_time w MP4" if video_utc is None else "brak daty w nagłówku HR"
+        note = f"sync fallback relative_zero: {reason}"
+        print(f"[warn] {note} ({path.name})")
+        return _relative_zero_series(times_clock, hrs_arr, float("nan"), note)
+
+    try:
+        warsaw = ZoneInfo("Europe/Warsaw")
+    except Exception as exc:  # noqa: BLE001
+        note = f"sync fallback relative_zero: zoneinfo ({exc})"
+        print(f"[warn] {note}")
+        return _relative_zero_series(times_clock, hrs_arr, float("nan"), note)
+
+    abs_local = _local_sample_times(header_local, times_clock, warsaw)
+    hr_start_utc = header_local.replace(tzinfo=warsaw).astimezone(UTC)
+    sync_offset = (video_utc - hr_start_utc).total_seconds()
+    t_s = np.array(
+        [(t.astimezone(UTC) - video_utc).total_seconds() for t in abs_local],
+        dtype=np.float64,
+    )
+    note = (
+        f"absolute_utc: video={video_utc.isoformat()} "
+        f"HR_header={hr_start_utc.isoformat()} offset={sync_offset:.3f}s"
+    )
+    series = PolarHrSeries(
+        t_s=t_s,
+        hr_bpm=hrs_arr,
+        sync_mode="absolute_utc",
+        sync_offset_s=float(sync_offset),
+        sync_note=note,
+    )
+    if video_duration_s is not None:
+        ok, msg = hr_video_time_overlap_ok(series, float(video_duration_s))
+        if not ok:
+            # Zwracamy serię, ale sync_note zawiera ostrzeżenie; caller może pominąć.
+            return PolarHrSeries(
+                t_s=series.t_s,
+                hr_bpm=series.hr_bpm,
+                sync_mode=series.sync_mode,
+                sync_offset_s=series.sync_offset_s,
+                sync_note=f"{note}; SANITY_FAIL: {msg}",
+            )
+    return series
+
+
 def load_polar_hr_csv(
     path: Path,
     skip_samples: int = POLAR_HR_SKIP_SAMPLES,
@@ -426,19 +386,15 @@ def load_polar_hr_csv(
 ) -> PolarHrSeries | None:
     """Wczytuje Polar HR.csv.
 
-    Bez ``video_path``: t_s względem pierwszego wiersza (kompatybilność wstecz).
-    Z ``video_path``: t_s = t_abs_HR_UTC − creation_time_wideo_UTC (zachowany offset ułamkowy).
+    Bez ``video_path``: t_s względem pierwszej próbki HR.
+    Z ``video_path``: t_s = t_abs_HR_UTC - creation_time_wideo_UTC (zachowany offset ułamkowy).
     """
-    import csv
-    from datetime import datetime, timezone
-
     with path.open(newline="") as f:
         rows = list(csv.reader(f))
     if len(rows) <= 1:
         return None
 
-    header = rows[0]
-    header_local = _parse_polar_hr_header_local(header)
+    header_local = _parse_polar_hr_header_local(rows[0])
 
     times_clock: list[datetime] = []
     hrs: list[float] = []
@@ -456,142 +412,9 @@ def load_polar_hr_csv(
     hrs_arr = np.asarray(hrs[skip_samples:], dtype=np.float64)
     times_clock = times_clock[skip_samples:]
 
-    # --- Ścieżka synchronizacji absolutnej ---
     if video_path is not None:
-        video_utc = probe_mp4_creation_time_utc(video_path)
-        if video_utc is None or header_local is None:
-            note = (
-                "sync fallback relative_zero: "
-                + (
-                    "brak creation_time w MP4"
-                    if video_utc is None
-                    else "brak daty w nagłówku HR"
-                )
-            )
-            print(f"[warn] {note} ({path.name})")
-            t0 = times_clock[0]
-            t_s = np.array([(t - t0).total_seconds() for t in times_clock], dtype=np.float64)
-            return PolarHrSeries(
-                t_s=t_s,
-                hr_bpm=hrs_arr,
-                sync_mode="relative_zero",
-                sync_offset_s=float("nan"),
-                sync_note=note,
-            )
-
-        try:
-            from zoneinfo import ZoneInfo
-
-            warsaw = ZoneInfo("Europe/Warsaw")
-        except Exception as exc:  # noqa: BLE001
-            note = f"sync fallback relative_zero: zoneinfo ({exc})"
-            print(f"[warn] {note}")
-            t0 = times_clock[0]
-            t_s = np.array([(t - t0).total_seconds() for t in times_clock], dtype=np.float64)
-            return PolarHrSeries(
-                t_s=t_s,
-                hr_bpm=hrs_arr,
-                sync_mode="relative_zero",
-                sync_offset_s=float("nan"),
-                sync_note=note,
-            )
-
-        # Absolutny czas lokalny każdej próbki (data z nagłówka + godzina z wiersza).
-        # Rollover po północy: gdy zegar < start nagłówka i sesja przeszła 00:00.
-        base_date = header_local.date()
-        abs_local: list[datetime] = []
-        day_offset = 0
-        prev_tod = None
-        for tc in times_clock:
-            tod = tc.time()
-            if prev_tod is not None and tod < prev_tod:
-                day_offset += 1
-            prev_tod = tod
-            from datetime import timedelta
-
-            d = base_date + timedelta(days=day_offset)
-            naive = datetime.combine(d, tod)
-            abs_local.append(naive.replace(tzinfo=warsaw))
-
-        hr_start_utc = header_local.replace(tzinfo=warsaw).astimezone(timezone.utc)
-        sync_offset = (video_utc - hr_start_utc).total_seconds()
-        t_s = np.array(
-            [(t.astimezone(timezone.utc) - video_utc).total_seconds() for t in abs_local],
-            dtype=np.float64,
+        return _absolute_utc_series(
+            path, header_local, times_clock, hrs_arr, video_path, video_duration_s
         )
-        note = (
-            f"absolute_utc: video={video_utc.isoformat()} "
-            f"HR_header={hr_start_utc.isoformat()} offset={sync_offset:.3f}s"
-        )
-        series = PolarHrSeries(
-            t_s=t_s,
-            hr_bpm=hrs_arr,
-            sync_mode="absolute_utc",
-            sync_offset_s=float(sync_offset),
-            sync_note=note,
-        )
-        if video_duration_s is not None:
-            ok, msg = hr_video_time_overlap_ok(series, float(video_duration_s))
-            if not ok:
-                # Zwracamy serię, ale sync_note zawiera ostrzeżenie; caller może pominąć.
-                return PolarHrSeries(
-                    t_s=series.t_s,
-                    hr_bpm=series.hr_bpm,
-                    sync_mode=series.sync_mode,
-                    sync_offset_s=series.sync_offset_s,
-                    sync_note=f"{note}; SANITY_FAIL: {msg}",
-                )
-        return series
-
-    # --- Legacy: od pierwszego wiersza ---
-    t0 = times_clock[0]
-    t_s = np.array([(t - t0).total_seconds() for t in times_clock], dtype=np.float64)
-    return PolarHrSeries(
-        t_s=t_s,
-        hr_bpm=hrs_arr,
-        sync_mode="relative_zero",
-        sync_offset_s=0.0,
-        sync_note="relative_zero (brak video_path)",
-    )
-
-
-def load_polar_hr(
-    subject: str,
-    scenario: str,
-    data_dir: Path = DATA_DIR,
-    skip_samples: int = POLAR_HR_SKIP_SAMPLES,
-    hr_column: int = POLAR_HR_COLUMN,
-    video_path: Path | None = None,
-    video_duration_s: float | None = None,
-) -> PolarHrSeries | None:
-    """Wczytuje Polar HR.csv; opcjonalnie synchronizuje do creation_time wideo."""
-    path = find_polar_hr_path(subject, scenario, data_dir)
-    if path is None:
-        return None
-    if video_path is None:
-        try:
-            rec = find_recording(subject, scenario, data_dir)
-            video_path = rec.rgb_path
-            if video_duration_s is None:
-                video_duration_s = probe_video(video_path).duration_s
-        except FileNotFoundError:
-            video_path = None
-    return load_polar_hr_csv(
-        path,
-        skip_samples=skip_samples,
-        hr_column=hr_column,
-        video_path=video_path,
-        video_duration_s=video_duration_s,
-    )
-
-
-def load_reference_hr(
-    subject: str,
-    scenario: str,
-    data_dir: Path = DATA_DIR,
-) -> tuple[PolarHrSeries | None, str]:
-    """Referencja walidacyjna: Polar *_HR.csv."""
-    hr = load_polar_hr(subject, scenario, data_dir)
-    if hr is not None and hr.hr_bpm.size >= 1:
-        return hr, "hr_csv"
-    return None, "none"
+    # Bez video_path: oś czasu od pierwszej próbki.
+    return _relative_zero_series(times_clock, hrs_arr, 0.0, "relative_zero (brak video_path)")

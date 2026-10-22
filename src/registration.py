@@ -1,6 +1,8 @@
-"""Korejestracja termika→RGB: segmentacja, affine z konturów, refine Y linii oczu."""
+"""Korejestracja termika->RGB: segmentacja, affine z konturów, refine Y linii oczu."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -10,6 +12,7 @@ from src.config import (
     REG_EYE_BAND_TOP,
     REG_EYE_LANDMARK_L,
     REG_EYE_LANDMARK_R,
+    REG_GO_RMS_PX,
     REG_MORPH_KERNEL,
     REG_NECK_WIDTH_FRAC,
     REG_NOMINAL_OFFSET,
@@ -21,8 +24,8 @@ from src.config import (
 _CONTOUR_SAMPLES: int = 36
 
 
-def _to_gray(frame: np.ndarray) -> np.ndarray:
-    """Klatka (H, W) lub (H, W, 3) → uint8 szarość."""
+def to_gray(frame: np.ndarray) -> np.ndarray:
+    """Klatka (H, W) lub (H, W, 3) -> uint8 szarość."""
     if frame.ndim == 2:
         return frame if frame.dtype == np.uint8 else np.clip(frame, 0, 255).astype(np.uint8)
     return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -77,7 +80,7 @@ def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
     smooth = np.convolve(profile, np.ones(k) / k, mode="same")
     n = len(smooth)
 
-    # Głowa ≠ globalne max (to często barki). Przy barkach w kadrze bierz
+    # Głowa != globalne max (to często barki). Przy barkach w kadrze bierz
     # maksimum w górnych ~40% sylwetki; inaczej globalne max = głowa.
     gmax = int(np.argmax(smooth))
     if gmax > 0.45 * n:
@@ -96,7 +99,8 @@ def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
     if gmax > 0.45 * n:
         search_end = min(search_end, gmax)
 
-    best_pinch: tuple[int, float] | None = None  # (idx, score) — najgłębsze przewężenie z wzrostem poniżej
+    # (idx, score) — najgłębsze przewężenie z wzrostem szerokości poniżej
+    best_pinch: tuple[int, float] | None = None
     for i in range(head_rel + min_gap, search_end):
         if not (smooth[i] <= smooth[i - 1] and smooth[i] <= smooth[i + 1]):
             continue
@@ -232,7 +236,7 @@ def affine_from_mask_moments(src_mask: np.ndarray, dst_mask: np.ndarray) -> np.n
 
 
 def affine_from_contours(src_mask: np.ndarray, dst_mask: np.ndarray) -> np.ndarray | None:
-    """Pełna affine LS z kątowo sparowanych punktów konturu (src→dst)."""
+    """Pełna affine LS z kątowo sparowanych punktów konturu (src->dst)."""
     src = contour_sample_points(src_mask)
     dst = contour_sample_points(dst_mask)
     if src is None or dst is None:
@@ -257,19 +261,12 @@ def invert_affine(matrix: np.ndarray) -> np.ndarray:
     return cv2.invertAffineTransform(np.asarray(matrix, dtype=np.float32)).astype(np.float64)
 
 
-def compose_affine(second: np.ndarray, first: np.ndarray) -> np.ndarray:
-    """Składa dwie macierze 2×3: wynik(p) = second(first(p))."""
-    a = np.vstack([first.astype(np.float64), [0.0, 0.0, 1.0]])
-    b = np.vstack([second.astype(np.float64), [0.0, 0.0, 1.0]])
-    return (b @ a)[:2]
-
-
 def map_rgb_mask_to_thermal(
     rgb_mask: np.ndarray,
     affine_th_to_rgb: np.ndarray,
     thermal_shape: tuple[int, int],
 ) -> np.ndarray:
-    """Mapuje maskę RGB → termika: thermal(p) = rgb(affine_th_to_rgb(p))."""
+    """Mapuje maskę RGB -> termika: thermal(p) = rgb(affine_th_to_rgb(p))."""
     th_h, th_w = thermal_shape
     ys, xs = np.mgrid[0:th_h, 0:th_w]
     pts = apply_affine(
@@ -336,7 +333,7 @@ def refine_affine_eye_y(
     thermal_mask: np.ndarray,
     landmarks: np.ndarray,
 ) -> tuple[np.ndarray, dict | None]:
-    """Koryguje ty affine wg linii oczu termika→RGB."""
+    """Koryguje ty affine wg linii oczu termika->RGB."""
     eye_th = thermal_eye_line(gray, thermal_mask)
     if eye_th is None:
         return affine, None
@@ -356,7 +353,7 @@ def refine_affine_eye_y(
 def _fit_affine_masks(
     thermal_mask: np.ndarray, face_mask: np.ndarray
 ) -> tuple[np.ndarray | None, str]:
-    """Affine termika→RGB z konturów, z fallbackiem na momenty."""
+    """Affine termika->RGB z konturów, z fallbackiem na momenty."""
     affine = affine_from_contours(thermal_mask, face_mask)
     if affine is not None:
         return affine, "contour"
@@ -371,12 +368,12 @@ def estimate_affine_thermal_to_rgb(
     thermal_frame: np.ndarray,
     landmarks: np.ndarray,
 ) -> tuple[np.ndarray | None, dict | str]:
-    """Estymuje affine termika→RGB: kontury masek + otoczka RGB + refine Y oczu."""
+    """Estymuje affine termika->RGB: kontury masek + otoczka RGB + refine Y oczu."""
     if landmarks is None or len(landmarks) < 3:
         return None, "brak landmarków RGB"
 
     rgb_h, rgb_w = rgb_frame.shape[:2]
-    gray = _to_gray(thermal_frame)
+    gray = to_gray(thermal_frame)
     window = nominal_thermal_window(landmarks, gray.shape)
     thermal_mask, seg_info = segment_thermal_face(gray, window)
     if thermal_mask is None:
@@ -392,7 +389,7 @@ def estimate_affine_thermal_to_rgb(
     init_affine = affine.copy()
     seg_mask = thermal_mask  # oryginał po neck-pinch — baza do kolejnych hull
 
-    # Iteracyjnie: otoczka RGB w termice → ponowne dopasowanie (zwykle 2–3× do <18 px).
+    # Iteracyjnie: otoczka RGB w termice -> ponowne dopasowanie (zwykle 2–3× do <18 px).
     hull_frac = 1.0
     n_hull = 0
     for _ in range(3):
@@ -452,7 +449,7 @@ def warp_thermal_to_rgb(
     rgb_shape: tuple[int, int],
 ) -> np.ndarray:
     """Warpuje klatkę termiczną do rozmiaru RGB macierzą 2×3 (wynik: float64 szarość)."""
-    gray = _to_gray(thermal_frame).astype(np.float64)
+    gray = to_gray(thermal_frame).astype(np.float64)
     height, width = rgb_shape
     return cv2.warpAffine(
         gray, affine.astype(np.float64), (width, height), flags=cv2.INTER_LINEAR
@@ -493,7 +490,7 @@ def calibrate_nominal_registration(
     window_pad: float = 1.6,
 ) -> dict:
     """Auto-kalibracja REG_NOMINAL_* z pierwszej pary klatek (pełna klatka + neck-pinch)."""
-    gray = _to_gray(thermal_frame)
+    gray = to_gray(thermal_frame)
     th_h, th_w = gray.shape[:2]
     mask, seg = segment_thermal_face(gray, (0, 0, th_w, th_h))
     if mask is None:
@@ -520,7 +517,7 @@ def apply_nominal_calibration(calib: dict) -> None:
 def registration_quality(
     affine: np.ndarray, thermal_mask: np.ndarray, rgb_mask: np.ndarray
 ) -> dict:
-    """Contour RMS, centroid error, IoU po warp (metodyka pilota)."""
+    """Contour RMS, błąd centroidu i IoU maski termicznej po warp na RGB."""
     src = contour_sample_points(thermal_mask)
     dst = contour_sample_points(rgb_mask)
     if src is None or dst is None:
@@ -561,8 +558,6 @@ def registration_quality(
     inter = np.logical_and(warped, rgb_mask).sum()
     union = np.logical_or(warped, rgb_mask).sum()
     iou = float(inter / max(1, union))
-    from src.config import REG_GO_RMS_PX
-
     return {
         "contour_rms_px": crms,
         "centroid_err_px": cent,
@@ -570,3 +565,25 @@ def registration_quality(
         "trustworthy": bool(crms <= REG_GO_RMS_PX),
         "go_threshold_px": float(REG_GO_RMS_PX),
     }
+
+
+@dataclass(frozen=True)
+class SceneRegistrationQuality:
+    """Jakość rejestracji całej sceny z prób odświeżenia affine.
+
+    Kolejność pól = kolejność kluczy w ``reg_quality.json``.
+    """
+
+    contour_rms_px: float  # mediana RMS konturu z udanych prób
+    iou: float  # mediana IoU z udanych prób
+    rms_first_px: float
+    iou_first: float
+    good_frac: float  # udział prób z RMS <= progu
+    n_attempts: int
+    trustworthy: bool  # mediana RMS <= progu
+    go_threshold_px: float
+
+    @property
+    def gate_label(self) -> str:
+        """Status gated: ``trustworthy`` albo ``NO-GO``."""
+        return "trustworthy" if self.trustworthy else "NO-GO"

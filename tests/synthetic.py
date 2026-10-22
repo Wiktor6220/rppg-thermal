@@ -154,31 +154,6 @@ def generate_synthetic_frames(
         "rgb_frames": rgb_frames,
         "thermal_frames": thermal_frames,
         "roi_mask": roi_mask,
-        "roi_positions": [roi_mask] * n_frames,
-        "valid": np.ones(n_frames, dtype=bool),
-        "patch_mask": patch_mask,
         "hr_bpm": hr_bpm,
         "t": t,
     }
-
-
-def generate_two_stage_pulse(
-    fs: float,
-    duration_s: float,
-    hr_bpm_stage1: float,
-    hr_bpm_stage2: float,
-    noise_std: float,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generuje parę (czysty, zaszumiony) sygnał pulsacyjny ze skokową zmianą HR w połowie."""
-    rng = np.random.default_rng(seed)
-    n_samples = int(round(fs * duration_s))
-    half = n_samples // 2
-
-    inst_freq_hz = np.concatenate(
-        [np.full(half, hr_bpm_stage1 / 60.0), np.full(n_samples - half, hr_bpm_stage2 / 60.0)]
-    )
-    phase = 2 * np.pi * np.cumsum(inst_freq_hz) / fs
-    clean = np.sin(phase) + 0.3 * np.sin(2 * phase)  # harmoniczna -> ostrzejsze piki, jak w PPG
-    noisy = clean + rng.normal(0.0, noise_std, size=n_samples)
-    return clean, noisy
