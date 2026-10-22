@@ -186,23 +186,6 @@ def gated_means_per_window_from_samples(
     return out, fallback
 
 
-def thermal_probe_points(thermal_mask: np.ndarray, n_contour: int = 16) -> np.ndarray | None:
-    """Centroid + próbka konturu maski termicznej (układ termiki)."""
-    mask_u8 = np.asarray(thermal_mask, dtype=bool).astype(np.uint8)
-    if not mask_u8.any():
-        return None
-    ys, xs = np.where(mask_u8)
-    centroid = np.array([[xs.mean(), ys.mean()]], dtype=np.float64)
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return centroid
-    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
-    if cnt.shape[0] < 3:
-        return centroid
-    idx = np.linspace(0, cnt.shape[0] - 1, num=min(n_contour, cnt.shape[0]), dtype=int)
-    return np.vstack([centroid, cnt[idx]])
-
-
 def affine_point_dispersion_px(
     matrices: list[np.ndarray],
     probe_pts_th: np.ndarray,

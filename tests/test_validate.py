@@ -123,6 +123,17 @@ def test_delta_snr_near_zero_for_equal_quality_signals():
     assert abs(float(np.mean(deltas))) < 0.15
 
 
+def test_quarter_frame_bounds_equal_split_last_takes_remainder():
+    """1889 klatek → 4 kolejne okna 472/472/472/473, bez luk i nakładania."""
+    from src.validate import quarter_frame_bounds
+
+    bounds = quarter_frame_bounds(1889)
+    assert [e - s for s, e in bounds] == [472, 472, 472, 473]
+    assert bounds[0][0] == 0
+    assert bounds[-1][1] == 1889
+    assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1))
+
+
 def test_octave_error_fraction():
     from src.validate import octave_error_fraction
 

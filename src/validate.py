@@ -7,7 +7,6 @@ import numpy as np
 from src.config import (
     MIN_VALID_RATIO,
     N_QUARTER_WINDOWS,
-    QUARTER_FIRST3_SEC,
     VALIDATION_STEP_SEC,
     VALIDATION_WINDOW_SEC,
 )
@@ -167,25 +166,6 @@ def usable_video_hr_range(
     return lo, hi
 
 
-def quarter_time_bounds(
-    t0: float,
-    t1: float,
-    first3_s: float = QUARTER_FIRST3_SEC,
-    n_windows: int = N_QUARTER_WINDOWS,
-) -> list[tuple[float, float]]:
-    """``n_windows`` równych, kolejnych, nienachodzących okien na [t0, t1].
-
-    ``first3_s`` zachowane w sygnaturze dla kompatybilności — nieużywane
-    (podział zawsze równy: duration/n_windows).
-    """
-    del first3_s  # legacy arg; równe kwartyle
-    dur = float(t1) - float(t0)
-    if dur <= 0 or n_windows < 1:
-        return [(float(t0), float(t0))] * max(1, n_windows)
-    w = dur / float(n_windows)
-    return [(t0 + i * w, t0 + (i + 1) * w) for i in range(n_windows)]
-
-
 def quarter_frame_bounds(
     n_samples: int,
     n_windows: int = N_QUARTER_WINDOWS,
@@ -218,15 +198,12 @@ def validate_against_hr_quarters(
     valid: np.ndarray | None = None,
     min_valid_ratio: float = MIN_VALID_RATIO,
     hr_estimator: Callable[[np.ndarray, float], float] = estimate_hr_welch,
-    first3_s: float = QUARTER_FIRST3_SEC,
 ) -> dict:
     """Walidacja vs Polar w 4 równych oknach na osi wideo [0, duration].
 
     Podział klatek: ``n // 4``; ostatnie okno bierze resztę. Per okno: Welch,
     mediana Polar w [t_a, t_b). Pominięcie przy valid_ratio < min albo braku ref.
-    ``first3_s`` — nieużywane (kompatybilność API).
     """
-    del first3_s
     estimated_signal = np.asarray(estimated_signal, dtype=np.float64)
     ref_t_s = np.asarray(ref_t_s, dtype=np.float64)
     ref_hr_bpm = np.asarray(ref_hr_bpm, dtype=np.float64)

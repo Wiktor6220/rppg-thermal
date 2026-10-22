@@ -1,18 +1,35 @@
-"""Szkic potoku: io_layer → roi → extract → methods → estimate → validate."""
+"""CLI potoku rPPG RGB+termika — cała logika w ``src.pipeline``.
 
-from src import config, estimate, extract, io_layer, methods, roi
+    uv run run.py                      # wszyscy badani z data/
+    uv run run.py --subject subject04  # jeden badany (agregat obejmuje cały --out)
+    uv run run.py --recalibrate        # wymuś ponowną kalibrację rejestracji per scena
+"""
+
+import argparse
+from pathlib import Path
+
+from src.config import DATA_DIR, PIPELINE_RESULTS_DIR
+from src.pipeline import run_pipeline
 
 
-def run(subject_dir):
-    rgb_frames, thermal_frames, ppg_reference, ppg_fs = io_layer.load_ibvp_subject(subject_dir)
-
-    roi_positions, valid = roi.track_roi_across_frames(rgb_frames)
-    rgb_trace = extract.extract_rgb_trace(rgb_frames, roi_positions, valid)
-
-    rppg_signal = methods.pos(rgb_trace, config.FS)
-    cleaned = estimate.bandpass_filter(estimate.detrend_signal(rppg_signal), config.FS)
-    return estimate.estimate_hr_welch(cleaned, config.FS)
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Potok rPPG RGB+termika (DJI) → metryki i figury.")
+    parser.add_argument("--data", type=Path, default=DATA_DIR, help="Katalog z danymi (domyślnie data/)")
+    parser.add_argument("--subject", default=None, help="np. subject04 (domyślnie wszyscy)")
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Przelicz reg_calib.json każdej sceny",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=PIPELINE_RESULTS_DIR,
+        help="Katalog wyjściowy (domyślnie results/pipeline/)",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run(config.DATA_DIR)
+    args = _parse_args()
+    run_pipeline(args.data, args.out, subject=args.subject, recalibrate=args.recalibrate)

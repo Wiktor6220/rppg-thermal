@@ -2,8 +2,7 @@
 
 from pathlib import Path
 
-# --- Sygnał ---
-FS: int = 30  # Hz (nominalnie; runtime bierze fps z metadanych)
+# --- Sygnał (fs zawsze z metadanych wideo) ---
 BAND_LOW_HZ: float = 0.7  # ~42 BPM
 BAND_HIGH_HZ: float = 4.0  # ~240 BPM
 
@@ -14,25 +13,14 @@ WELCH_SEGMENT_SEC: float = 10.0
 
 # --- Eval ---
 EVAL_SUBJECT: str = "subject02"
-REF_SOURCE: str = "hr_csv"
+# Badani z nietypowo wysokim HR referencji (Polar do ~190 BPM): zostają w tabelach,
+# werdykt w summary.md liczy statystyki bez nich.
+REF_SUSPECT_SUBJECTS: tuple[str, ...] = ("subject03",)
 VALIDATION_WINDOW_SEC: float = 10.0
 VALIDATION_STEP_SEC: float = 5.0
 MIN_VALID_RATIO: float = 0.5  # min. udział valid[] w oknie
-# Demo / praca: 4 równe okna (n//4 klatek; ostatnie bierze resztę)
-QUARTER_FIRST3_SEC: float = 15.0  # legacy, nieużywane przy równym podziale
+# 4 równe okna (n//4 klatek; ostatnie bierze resztę)
 N_QUARTER_WINDOWS: int = 4
-
-# --- ROI czoła (deterministyczny inset poniżej linii włosów) ---
-FOREHEAD_TOP_INSET_FRAC: float = 0.40  # odetnij górne 40% wysokości bboxa czoła
-
-# --- Metryki jakości ROI (tylko informacyjne — nie bramkują wyboru) ---
-SKIN_FRAC_MIN: float = 0.50  # legacy / diagnostyka
-REGION_MIN_VALID_FRAC: float = 0.30
-PEAK_SNR_CONF_HIGH_DB: float = 2.0
-PEAK_SNR_CONF_MED_DB: float = -2.0
-PEAK_SNR_BIN_WIDTH_HZ: float = 0.2
-PEAK_SNR_N_HARMONICS: int = 2
-HEADLINE_REGION: str = "cheeks"  # stały region headline (bez selektora)
 
 # --- Maska perfuzji ---
 PERFUSION_TEMP_STD_FACTOR: float = 0.5  # próg: mean + k*std w ROI
@@ -42,17 +30,7 @@ PERFUSION_MIN_ROI_FRAC: float = 0.10  # poniżej → fallback do pełnego ROI
 POLAR_HR_COLUMN: int = 3  # 0-based; kolumna BPM
 POLAR_HR_SKIP_SAMPLES: int = 0
 
-# --- Polar ECG (tylko skrypty diagnostyczne) ---
-ECG_FS_HZ: float = 130.0
-ECG_SKIP_SEC: float = 10.0
-ECG_FRAME_MARKERS: tuple[tuple[int, int, int, int], ...] = (
-    (67, 82, 8, 0),
-    (68, 82, 8, 0),
-)
-ECG_HR_MIN_BPM: float = 45.0
-ECG_HR_MAX_BPM: float = 140.0
-
-# --- Affine refresh [klatki] ---
+# --- Affine refresh [klatki]; klucz = nazwa sceny, brak klucza → DEFAULT ---
 AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s1_rest_rest": 30,
     "s2_person_move": 30,
@@ -61,7 +39,6 @@ AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
     "s5_approach": 5,
 }
 AFFINE_EVERY_DEFAULT: int = 30
-AFFINE_FIXED_MEDIAN_N: int = 30
 
 # --- Korejestracja ---
 REG_NOMINAL_SCALE: float = 0.52
@@ -79,6 +56,7 @@ REG_GO_RMS_PX: float = 18.0
 ROOT_DIR: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = ROOT_DIR / "data"
 RESULTS_DIR: Path = ROOT_DIR / "results"
+PIPELINE_RESULTS_DIR: Path = RESULTS_DIR / "pipeline"  # domyślne --out w run.py
 MODELS_DIR: Path = ROOT_DIR / "models"
 FACE_LANDMARKER_MODEL_PATH: Path = MODELS_DIR / "face_landmarker.task"
 
