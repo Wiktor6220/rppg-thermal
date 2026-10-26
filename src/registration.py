@@ -8,17 +8,27 @@ import cv2
 import numpy as np
 
 from src.config import (
+    REG_AFFINE_MAX_ANISO,
+    REG_AFFINE_SCALE_RANGE,
+    REG_CALIB_WINDOW_PAD,
     REG_EYE_BAND_BOTTOM,
     REG_EYE_BAND_TOP,
     REG_EYE_LANDMARK_L,
     REG_EYE_LANDMARK_R,
     REG_GO_RMS_PX,
     REG_MORPH_KERNEL,
+    REG_NECK_MIN_FRAC,
     REG_NECK_WIDTH_FRAC,
     REG_NOMINAL_OFFSET,
     REG_NOMINAL_SCALE,
+    REG_PRIOR_OFFSET,
+    REG_PRIOR_SCALE,
+    REG_SCALE_RANGE,
     REG_WINDOW_PAD,
 )
+
+# Ile największych składowych po progowaniu rozważać jako kandydatów na głowę.
+_MAX_SEG_CANDIDATES: int = 5
 
 # Liczba punktów konturu do estimateAffine2D (empirycznie stabilne 24–48).
 _CONTOUR_SAMPLES: int = 36
@@ -40,19 +50,57 @@ def rgb_face_mask(landmarks: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return mask.astype(bool)
 
 
-def nominal_thermal_window(
-    landmarks: np.ndarray, thermal_shape: tuple[int, int]
+def landmark_bbox_size(landmarks: np.ndarray) -> tuple[float, float]:
+    """(szerokość, wysokość) bboxa landmarków RGB, min. 1 px."""
+    xs, ys = landmarks[:, 0], landmarks[:, 1]
+    return max(1.0, float(xs.max() - xs.min())), max(1.0, float(ys.max() - ys.min()))
+
+
+def scale_is_plausible(scale: float) -> bool:
+    """Czy skala termika/RGB mieści się w ``REG_SCALE_RANGE`` (segment = głowa)."""
+    lo, hi = REG_SCALE_RANGE
+    return bool(np.isfinite(scale) and lo <= scale <= hi)
+
+
+def affine_scale(affine: np.ndarray) -> float:
+    """Skala affine: sqrt(|det A[:2, :2]|)."""
+    return float(np.sqrt(abs(np.linalg.det(np.asarray(affine, dtype=np.float64)[:2, :2]))))
+
+
+def affine_anisotropy(affine: np.ndarray) -> float:
+    """Anizotropia affine: σ1/σ2 z SVD A[:2, :2] (1 = podobieństwo); inf przy osobliwej."""
+    sv = np.linalg.svd(np.asarray(affine, dtype=np.float64)[:2, :2], compute_uv=False)
+    return float(sv[0] / sv[1]) if sv[1] > 0 else float("inf")
+
+
+def affine_is_plausible(affine: np.ndarray) -> bool:
+    """Skala w ``REG_AFFINE_SCALE_RANGE`` i anizotropia ≤ ``REG_AFFINE_MAX_ANISO``.
+
+    Kamery RGB i termiczna są sztywno złączone, więc affine termika->RGB jest prawie
+    podobieństwem o skali zbliżonej do stosunku rozdzielczości.
+    """
+    lo, hi = REG_AFFINE_SCALE_RANGE
+    scale = affine_scale(affine)
+    aniso = affine_anisotropy(affine)
+    return bool(np.isfinite(scale) and lo <= scale <= hi and aniso <= REG_AFFINE_MAX_ANISO)
+
+
+def thermal_window_from_mapping(
+    landmarks: np.ndarray,
+    thermal_shape: tuple[int, int],
+    scale: float,
+    offset: tuple[float, float],
+    pad: float,
 ) -> tuple[int, int, int, int]:
-    """Hojne okno w termice z nominalnego odwzorowania bboxa twarzy RGB."""
+    """Okno w termice z odwzorowania bboxa twarzy RGB: ``scale·p + offset``, rozmiar × ``pad``."""
     xs, ys = landmarks[:, 0], landmarks[:, 1]
     cx = 0.5 * (xs.min() + xs.max())
     cy = 0.5 * (ys.min() + ys.max())
-    fw = max(1.0, float(xs.max() - xs.min()))
-    fh = max(1.0, float(ys.max() - ys.min()))
-    tcx = REG_NOMINAL_SCALE * cx + REG_NOMINAL_OFFSET[0]
-    tcy = REG_NOMINAL_SCALE * cy + REG_NOMINAL_OFFSET[1]
-    tw = REG_NOMINAL_SCALE * fw * REG_WINDOW_PAD
-    th = REG_NOMINAL_SCALE * fh * REG_WINDOW_PAD
+    fw, fh = landmark_bbox_size(landmarks)
+    tcx = scale * cx + offset[0]
+    tcy = scale * cy + offset[1]
+    tw = scale * fw * pad
+    th = scale * fh * pad
     height, width = thermal_shape
     x0 = max(0, int(tcx - tw / 2))
     x1 = min(width, int(tcx + tw / 2))
@@ -61,12 +109,25 @@ def nominal_thermal_window(
     return x0, y0, x1, y1
 
 
-def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
+def nominal_thermal_window(
+    landmarks: np.ndarray, thermal_shape: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """Hojne okno w termice z bieżącego odwzorowania nominalnego (``REG_NOMINAL_*``)."""
+    return thermal_window_from_mapping(
+        landmarks, thermal_shape, REG_NOMINAL_SCALE, REG_NOMINAL_OFFSET, REG_WINDOW_PAD
+    )
+
+
+def _cut_neck_width_profile(
+    comp: np.ndarray, min_cut_rows: int = 0
+) -> tuple[np.ndarray, dict]:
     """Odcina barki w lokalnym minimum szerokości między głową a barkami.
 
     Profil wierszy: szerokość rośnie na twarzy, maleje na szyi, znów rośnie na barkach.
     Gdy barki nie są w kadrze — fallback: spadek poniżej ``REG_NECK_WIDTH_FRAC``
     względem maksimum głowy (nie globalnego najszerszego wiersza).
+    Cięcie nie wyżej niż ``min_cut_rows`` wierszy od góry segmentu (przewężenie na
+    wysokości oczu, np. ciemne szkła okularów, nie jest szyją).
     """
     rows_w = comp.sum(axis=1).astype(np.float64)
     nz = np.where(rows_w > 0)[0]
@@ -101,7 +162,7 @@ def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
 
     # (idx, score) — najgłębsze przewężenie z wzrostem szerokości poniżej
     best_pinch: tuple[int, float] | None = None
-    for i in range(head_rel + min_gap, search_end):
+    for i in range(max(head_rel + min_gap, min_cut_rows), search_end):
         if not (smooth[i] <= smooth[i - 1] and smooth[i] <= smooth[i + 1]):
             continue
         below = smooth[i + 1 : min(n, i + 1 + look_ahead)]
@@ -127,7 +188,7 @@ def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
         info["neck_method"] = "pinch_best"
 
     if neck_rel is None:
-        for i in range(head_rel + 1, search_end + 1):
+        for i in range(max(head_rel + 1, min_cut_rows), search_end + 1):
             if smooth[i] < REG_NECK_WIDTH_FRAC * head_w:
                 neck_rel = i
                 info["neck_method"] = "head_frac_fallback"
@@ -141,10 +202,31 @@ def _cut_neck_width_profile(comp: np.ndarray) -> tuple[np.ndarray, dict]:
     return out, info
 
 
+def _component_bbox_size(comp: np.ndarray) -> tuple[float, float] | None:
+    """(szerokość, wysokość) bboxa składowej (konwencja jak ``infer_nominal_from_masks``)."""
+    ys, xs = np.nonzero(comp)
+    if xs.size == 0:
+        return None
+    return max(1.0, float(xs.max() - xs.min())), max(1.0, float(ys.max() - ys.min()))
+
+
+def _size_mismatch(wh: tuple[float, float], expected_wh: tuple[float, float]) -> float:
+    """|ln(w/ew)| + |ln(h/eh)| — 0 przy idealnym rozmiarze."""
+    return abs(float(np.log(wh[0] / expected_wh[0]))) + abs(float(np.log(wh[1] / expected_wh[1])))
+
+
 def segment_thermal_face(
-    gray: np.ndarray, window: tuple[int, int, int, int]
+    gray: np.ndarray,
+    window: tuple[int, int, int, int],
+    expected_wh: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray | None, dict | str]:
-    """Segmentuje twarz w oknie: Otsu + morfologia + największa składowa + cięcie szyi."""
+    """Segmentuje twarz w oknie: Otsu + morfologia + wybór składowej + cięcie szyi.
+
+    Kandydaci: do ``_MAX_SEG_CANDIDATES`` największych składowych, każda po cięciu szyi.
+    Bez ``expected_wh`` — największa. Z ``expected_wh`` (oczekiwany rozmiar głowy w px
+    termiki) — kandydat o bboxie najbliższym oczekiwanemu (``_size_mismatch``), żeby
+    jasny tułów nie wygrywał z głową tylko dlatego, że jest większy.
+    """
     x0, y0, x1, y1 = window
     win = gray[y0:y1, x0:x1]
     if win.size == 0:
@@ -158,10 +240,25 @@ def segment_thermal_face(
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binw, connectivity=8)
     if n_labels <= 1:
         return None, "brak spójnej składowej po progowaniu"
-    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    comp = (labels == biggest).astype(np.uint8)
+    # Stabilne sortowanie: przy remisie pola wygrywa niższa etykieta (jak np.argmax).
+    order = 1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA], kind="stable")
+    candidates = [int(lab) for lab in order[:_MAX_SEG_CANDIDATES]]
 
-    comp, neck_info = _cut_neck_width_profile(comp)
+    min_cut_rows = 0 if expected_wh is None else int(REG_NECK_MIN_FRAC * expected_wh[1])
+    picked_rank = 0
+    comp, neck_info = _cut_neck_width_profile(
+        (labels == candidates[0]).astype(np.uint8), min_cut_rows
+    )
+    if expected_wh is not None:
+        best_cost = np.inf
+        for rank, lab in enumerate(candidates):
+            cut, info = _cut_neck_width_profile((labels == lab).astype(np.uint8), min_cut_rows)
+            wh = _component_bbox_size(cut)
+            if wh is None:
+                continue
+            cost = _size_mismatch(wh, expected_wh)
+            if cost < best_cost:
+                best_cost, picked_rank, comp, neck_info = cost, rank, cut, info
 
     mask = np.zeros_like(gray, dtype=bool)
     mask[y0:y1, x0:x1] = comp.astype(bool)
@@ -176,6 +273,8 @@ def segment_thermal_face(
         "neck_method": neck_info.get("neck_method"),
         "cut_row": None if cut_local is None else int(y0 + cut_local),
         "head_row": None if head_local is None else int(y0 + head_local),
+        "n_candidates": len(candidates),
+        "picked_rank": picked_rank,
     }
 
 
@@ -375,9 +474,13 @@ def estimate_affine_thermal_to_rgb(
     rgb_h, rgb_w = rgb_frame.shape[:2]
     gray = to_gray(thermal_frame)
     window = nominal_thermal_window(landmarks, gray.shape)
-    thermal_mask, seg_info = segment_thermal_face(gray, window)
+    fw, fh = landmark_bbox_size(landmarks)
+    expected_wh = (REG_NOMINAL_SCALE * fw, REG_NOMINAL_SCALE * fh)
+    thermal_mask, seg_info = segment_thermal_face(gray, window, expected_wh)
     if thermal_mask is None:
         return None, f"segmentacja: {seg_info}"
+    # Skala segmentu względem twarzy RGB — tylko diagnostyka (nie wpływa na scale_ok).
+    seg_scale = infer_nominal_from_masks(landmarks, thermal_mask)[0]
 
     face_mask = rgb_face_mask(landmarks, (rgb_h, rgb_w))
     if not face_mask.any():
@@ -439,6 +542,12 @@ def estimate_affine_thermal_to_rgb(
         "seg": seg_info,
         "hull_frac": hull_frac,
         "n_hull_iters": n_hull,
+        "seg_scale": float(seg_scale),
+        "affine_scale": affine_scale(affine),
+        "affine_aniso": affine_anisotropy(affine),
+        # Końcowy affine (po hull i eye_y): segment spoza głowy (tułów, samo czoło)
+        # daje skalę/anizotropię niemożliwą dla sztywnej pary kamer.
+        "scale_ok": affine_is_plausible(affine),
     }
     return affine, info
 
@@ -489,13 +598,32 @@ def calibrate_nominal_registration(
     landmarks: np.ndarray,
     window_pad: float = 1.6,
 ) -> dict:
-    """Auto-kalibracja REG_NOMINAL_* z pierwszej pary klatek (pełna klatka + neck-pinch)."""
+    """Auto-kalibracja REG_NOMINAL_* z jednej pary klatek.
+
+    Segmentacja w oknie z priora (``REG_PRIOR_*``, ``REG_CALIB_WINDOW_PAD``) z oczekiwanym
+    rozmiarem głowy ``REG_PRIOR_SCALE`` × bbox twarzy RGB. ``ValueError``, gdy segmentacja
+    się nie uda albo szerokość lub wysokość segmentu względem twarzy RGB wypada poza
+    ``REG_SCALE_RANGE`` (caller może wziąć inną klatkę).
+    """
     gray = to_gray(thermal_frame)
-    th_h, th_w = gray.shape[:2]
-    mask, seg = segment_thermal_face(gray, (0, 0, th_w, th_h))
+    window = thermal_window_from_mapping(
+        landmarks, gray.shape[:2], REG_PRIOR_SCALE, REG_PRIOR_OFFSET, REG_CALIB_WINDOW_PAD
+    )
+    fw, fh = landmark_bbox_size(landmarks)
+    expected_wh = (REG_PRIOR_SCALE * fw, REG_PRIOR_SCALE * fh)
+    mask, seg = segment_thermal_face(gray, window, expected_wh)
     if mask is None:
-        raise RuntimeError(f"kalibracja: segmentacja pełnoklatkowa nieudana ({seg})")
+        raise ValueError(f"kalibracja: segmentacja w oknie priora nieudana ({seg})")
     scale, offset, meta = infer_nominal_from_masks(landmarks, mask)
+    # Osobno szerokość i wysokość: segment ucięty na oczach (samo czoło) ma dobrą
+    # szerokość, ale za małą wysokość, a średnia obu mogłaby zmieścić się w zakresie.
+    scale_w = meta["th_size"][0] / meta["rgb_size"][0]
+    scale_h = meta["th_size"][1] / meta["rgb_size"][1]
+    if not (scale_is_plausible(scale_w) and scale_is_plausible(scale_h)):
+        raise ValueError(
+            f"nieprawdopodobna skala segmentu: szer. {scale_w:.2f}, wys. {scale_h:.2f} "
+            f"(zakres {REG_SCALE_RANGE[0]}–{REG_SCALE_RANGE[1]}) — segment w termice to nie głowa"
+        )
     return {
         "REG_NOMINAL_SCALE": scale,
         "REG_NOMINAL_OFFSET": [offset[0], offset[1]],

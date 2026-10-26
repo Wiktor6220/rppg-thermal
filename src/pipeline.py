@@ -35,7 +35,7 @@ from src.extract import (
     mean_rgb_in_mask,
     sample_roi_temps_via_affine,
 )
-from src.figures import SignalKey, WindowHrs, save_scene_figures
+from src.figures import SignalKey, WindowHrs, save_registration_figures, save_scene_figures
 from src.io_layer import (
     LoadedRecording,
     PolarHrSeries,
@@ -51,6 +51,7 @@ from src.registration import (
     calibrate_nominal_registration,
     estimate_affine_thermal_to_rgb,
     registration_quality,
+    scale_is_plausible,
     to_gray,
 )
 from src.report import write_scene_tables, write_summary
@@ -118,8 +119,11 @@ def discover_sessions(data_dir: Path) -> list[tuple[str, str, Path]]:
     return out
 
 
-def resolve_dji_streams(session_dir: Path) -> tuple[Path, Path, Path]:
-    """Ścieżki (RGB, termika, HR): *_RGB.MP4/*_V.MP4, *_T.MP4, dataHR_*.csv/*_HR.csv."""
+def resolve_dji_streams(session_dir: Path) -> tuple[Path, Path, Path | None]:
+    """Ścieżki (RGB, termika, HR): *_RGB.MP4/*_V.MP4, *_T.MP4, dataHR_*.csv/*_HR.csv.
+
+    Brak pliku HR -> ``None`` (wymagany dopiero w trybie z metrykami).
+    """
     rgb = _pick_one(
         list(session_dir.glob("*_RGB.MP4"))
         + list(session_dir.glob("*_RGB.mp4"))
@@ -136,13 +140,17 @@ def resolve_dji_streams(session_dir: Path) -> tuple[Path, Path, Path]:
     hr_candidates = sorted(session_dir.glob("dataHR_*.csv"))
     if not hr_candidates:
         hr_candidates = sorted(session_dir.glob("*_HR.csv"))
-    hr = _pick_one(hr_candidates, "HR (dataHR_*.csv/*_HR.csv)", session_dir)
+    hr = (
+        _pick_one(hr_candidates, "HR (dataHR_*.csv/*_HR.csv)", session_dir)
+        if hr_candidates
+        else None
+    )
     return rgb, thermal, hr
 
 
 def load_session(
     session_dir: Path, subject: str, scenario: str
-) -> tuple[LoadedRecording, Path]:
+) -> tuple[LoadedRecording, Path | None]:
     """Nagranie RGB+termika sesji i ścieżka Polar HR."""
     rgb_path, th_path, hr_path = resolve_dji_streams(session_dir)
     rec = Recording(
@@ -170,25 +178,42 @@ def _try_calibrate_from_session(
     scenario: str,
     max_frames: int = 90,
 ) -> dict | None:
-    """Kalibracja z pierwszej klatki z twarzą w sesji; None gdy brak detekcji."""
+    """Kalibracja z pierwszej klatki z twarzą, dla której segment w termice ma skalę głowy.
+
+    Klatki odrzucone przez ``calibrate_nominal_registration`` (``ValueError``) są pomijane
+    w limicie ``max_frames``; brak udanej -> None (caller sięga po fallbacki).
+    """
     loaded, _ = load_session(session_dir, subject, scenario)
     detector = make_cropping_detector()
+    n_rejected = 0
+    last_error = ""
     for i, (rgb, thermal, _) in enumerate(loaded.synced_pairs(reference="rgb")):
         if i >= max_frames:
             break
         lm = detector(rgb)
         if lm is None:
             continue
-        calib = calibrate_nominal_registration(rgb, thermal, lm)
+        try:
+            calib = calibrate_nominal_registration(rgb, thermal, lm)
+        except ValueError as exc:
+            n_rejected += 1
+            last_error = str(exc)
+            continue
+        if n_rejected:
+            print(f"  kalibracja {subject}/{scenario}: odrzucono {n_rejected} kl. ({last_error})")
         calib["source"] = f"{subject}/{scenario}#frame{i}"
         return calib
+    print(
+        f"  kalibracja {subject}/{scenario}: brak udanej klatki w {max_frames} "
+        f"(odrzucono {n_rejected} kl. z twarzą; ostatni błąd: {last_error or '—'})"
+    )
     return None
 
 
 def _best_sibling_calib(
     out_root: Path, subject: str, exclude_scenario: str
 ) -> tuple[dict, str] | None:
-    """Fallback: scena tego badanego z najniższym RMS w reg_quality.json."""
+    """Fallback: scena tego badanego z najniższym RMS i skalą w ``REG_SCALE_RANGE``."""
     subj_root = out_root / subject
     if not subj_root.is_dir():
         return None
@@ -203,7 +228,10 @@ def _best_sibling_calib(
         try:
             q = json.loads(qpath.read_text(encoding="utf-8"))
             rms = float(q.get("contour_rms_px", float("inf")))
-        except (json.JSONDecodeError, TypeError, ValueError):
+            scale = float(json.loads(cpath.read_text(encoding="utf-8"))["REG_NOMINAL_SCALE"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if not scale_is_plausible(scale):
             continue
         if best is None or rms < best[0]:
             best = (rms, cpath, scen_dir.name)
@@ -300,10 +328,14 @@ def _scene_registration_quality(
     first_quality: dict,
     threshold: float = REG_GO_RMS_PX,
 ) -> SceneRegistrationQuality:
-    """Jakość rejestracji całej sceny: mediany RMS/IoU udanych prób + udział dobrych."""
+    """Jakość rejestracji całej sceny: mediany RMS/IoU udanych prób + udział dobrych.
+
+    Próby z odrzuconym affine mają RMS = inf: wchodzą do mediany RMS (ciągną ją w górę),
+    NaN nie wchodzi. Trustworthy tylko przy skończonej medianie ≤ progu.
+    """
     rms = np.asarray(attempts_rms, dtype=np.float64)
     iou = np.asarray(attempts_iou, dtype=np.float64)
-    rms_ok = rms[np.isfinite(rms)]
+    rms_ok = rms[~np.isnan(rms)]
     iou_ok = iou[np.isfinite(iou)]
     rms_med = float(np.median(rms_ok)) if rms_ok.size else float("nan")
     return SceneRegistrationQuality(
@@ -342,6 +374,7 @@ class _TraceState:
     n_affine_ok: int = 0
     n_affine_fail: int = 0
     n_affine_rejected: int = 0
+    n_affine_implausible: int = 0
     attempts_rms: list[float] = field(default_factory=list)
     attempts_iou: list[float] = field(default_factory=list)
     plain_lists: dict[str, list] = field(default_factory=_per_region)
@@ -374,6 +407,7 @@ class SceneTraces:
     n_affine_ok: int
     n_affine_fail: int
     n_affine_rejected: int
+    n_affine_implausible: int
     fallback_pct: dict[str, float]
 
 
@@ -411,7 +445,12 @@ def _refresh_affine(
     thermal: np.ndarray,
     landmarks: np.ndarray,
 ) -> None:
-    """Próba nowego affine: jakość każdej próby, podmiana wg ``_accept_affine``."""
+    """Próba nowego affine: jakość każdej próby, podmiana wg ``_accept_affine``.
+
+    Próba z nieprawdopodobnym affine (``affine_is_plausible``: skala/anizotropia)
+    liczy się jako nieudana (RMS = inf)
+    i nigdy nie zastępuje bieżącego affine.
+    """
     new_aff, info = estimate_affine_thermal_to_rgb(rgb, thermal, landmarks)
     if new_aff is None:
         st.n_affine_fail += 1
@@ -422,8 +461,18 @@ def _refresh_affine(
     new_aff = new_aff.astype(np.float64)
     st.n_affine_ok += 1
     q = registration_quality(new_aff, info["thermal_mask"], info["rgb_mask"])
-    st.attempts_rms.append(float(q["contour_rms_px"]))
-    st.attempts_iou.append(float(q["iou"]))
+    scale_ok = bool(info["scale_ok"])
+    q["scale_ok"] = scale_ok
+    q["seg_scale"] = float(info["seg_scale"])
+    q["affine_scale"] = float(info["affine_scale"])
+    q["affine_aniso"] = float(info["affine_aniso"])
+    if scale_ok:
+        st.attempts_rms.append(float(q["contour_rms_px"]))
+        st.attempts_iou.append(float(q["iou"]))
+    else:
+        st.n_affine_implausible += 1
+        st.attempts_rms.append(np.inf)
+        st.attempts_iou.append(np.nan)
     if st.first_quality is None:
         st.frame0_rgb = rgb.copy()
         st.frame0_th = thermal.copy()
@@ -433,6 +482,8 @@ def _refresh_affine(
         st.quality_frame_idx = i
         if i > 0:
             print(f"  [info] pierwsza udana rejestracja na klatce {i}", flush=True)
+    if not scale_ok:
+        return
     cand_rms = float(q["contour_rms_px"])
     if _accept_affine(cand_rms, st.affine_rms, st.affine_trusted):
         st.affine = new_aff
@@ -460,7 +511,7 @@ def _consume_frame(
         else:
             _append_sample(st, rgb, thermal, st.last_lm, False)
         return
-    if st.affine is None or (i % st.affine_every == 0):
+    if st.first_quality is None or i % st.affine_every == 0:
         _refresh_affine(st, i, rgb, thermal, landmarks)
     if st.last_lm is None and st.pending:
         for pr, pt in st.pending:
@@ -527,6 +578,7 @@ def _finalize_traces(st: _TraceState, subject: str, scenario: str) -> SceneTrace
         n_affine_ok=st.n_affine_ok,
         n_affine_fail=st.n_affine_fail,
         n_affine_rejected=st.n_affine_rejected,
+        n_affine_implausible=st.n_affine_implausible,
         fallback_pct={"forehead": fb_fore, "cheeks": fb_cheek},
     )
 
@@ -675,6 +727,7 @@ def _write_reg_quality(out_dir: Path, ex: SceneTraces, reg_calib_source: str) ->
         "affine_ok": ex.n_affine_ok,
         "affine_fail": ex.n_affine_fail,
         "affine_rejected": ex.n_affine_rejected,
+        "affine_implausible": ex.n_affine_implausible,
         "valid_pct": float(100.0 * ex.valid.mean()),
         "quality_frame_idx": ex.quality_frame_idx,
         "windowing": "quarters_4",
@@ -696,6 +749,7 @@ def run_session(
     out_dir: Path,
     *,
     reg_calib_source: str = "self",
+    figures_only: bool = False,
 ) -> dict:
     """Jedna scena; natywny stderr (MediaPipe) -> ``<out_dir>/run_stderr.log``."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -708,7 +762,38 @@ def run_session(
             out_dir,
             stderr_log,
             reg_calib_source=reg_calib_source,
+            figures_only=figures_only,
         )
+
+
+def _run_registration_only(
+    loaded: LoadedRecording,
+    subject: str,
+    scenario: str,
+    out_dir: Path,
+    stderr_log: Path,
+    reg_calib_source: str,
+) -> dict:
+    """Tryb ``figures_only``: rejestracja + ``reg_quality.json`` + figury rejestracji, bez HR."""
+    print(f"\n{'=' * 60}")
+    print(
+        f"{subject}/{scenario}  {loaded.rgb_meta.frame_count} kl. @ "
+        f"{loaded.rgb_meta.fps:.3f} fps  [figures-only: bez HR i metryk]"
+    )
+    print(f"  native stderr → {stderr_log}")
+    ex = _extract_traces(loaded, subject, scenario)
+    quality_dict = _write_reg_quality(out_dir, ex, reg_calib_source)
+    save_registration_figures(
+        out_dir,
+        rgb=ex.frame0_rgb,
+        thermal=ex.frame0_th,
+        landmarks=ex.frame0_lm,
+        reg_info=ex.reg_info0,
+        first_quality=ex.first_quality,
+        scene_quality=ex.quality,
+    )
+    print(f"Figury rejestracji → {out_dir}/fig_*.png")
+    return {"rows": [], "quality": quality_dict, "gated_status": ex.quality.gate_label}
 
 
 def _run_session_body(
@@ -719,8 +804,15 @@ def _run_session_body(
     stderr_log: Path,
     *,
     reg_calib_source: str = "self",
+    figures_only: bool = False,
 ) -> dict:
     loaded, hr_path = load_session(session_dir, subject, scenario)
+    if figures_only:
+        return _run_registration_only(
+            loaded, subject, scenario, out_dir, stderr_log, reg_calib_source
+        )
+    if hr_path is None:
+        raise FileNotFoundError(f"Brak HR (dataHR_*.csv/*_HR.csv) w {session_dir}")
     fs = loaded.rgb_meta.fps
     n_frames = loaded.rgb_meta.frame_count
     duration_s = float(loaded.rgb_meta.duration_s)
@@ -823,8 +915,12 @@ def run_pipeline(
     *,
     subject: str | None = None,
     recalibrate: bool = False,
+    figures_only: bool = False,
 ) -> list[dict]:
-    """Przetwarza sesje z ``data_dir`` (opcjonalnie jednego badanego) i odświeża agregat."""
+    """Przetwarza sesje z ``data_dir`` (opcjonalnie jednego badanego) i odświeża agregat.
+
+    ``figures_only``: tylko rejestracja i jej figury (bez Polar, metryk i agregatu).
+    """
     _quiet_native_env()
     matplotlib.use("Agg")
     data_dir = data_dir.resolve()
@@ -843,10 +939,19 @@ def run_pipeline(
             _, calib_src = ensure_scene_calibration(
                 data_dir, out_root, subj, scenario, session_dir, force=recalibrate
             )
-        result = run_session(subj, scenario, session_dir, out_dir, reg_calib_source=calib_src)
+        result = run_session(
+            subj,
+            scenario,
+            session_dir,
+            out_dir,
+            reg_calib_source=calib_src,
+            figures_only=figures_only,
+        )
         if result.get("skipped"):
             print(f"\n→ {subj}/{scenario}: SKIP (sync sanity)")
             continue
         _print_session_result(subj, scenario, result)
 
+    if figures_only:
+        return []
     return write_summary(out_root)

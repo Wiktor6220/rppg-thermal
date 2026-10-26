@@ -147,3 +147,108 @@ def test_constrain_thermal_mask_to_rgb_face():
     assert constrained.sum() < th.sum()
     # punkt poza hull RGB (w termice nisko) powinien zniknąć
     assert not constrained[85, 40]
+
+
+def _head_and_torso_thermal() -> np.ndarray:
+    """Mała jasna elipsa (głowa) nad dużym jasnym prostokątem (tułów), rozdzielone ciemnym pasem."""
+    import cv2
+
+    gray = np.full((400, 300), 30, dtype=np.uint8)
+    cv2.ellipse(gray, (150, 80), (30, 40), 0, 0, 360, 220, -1)  # głowa: bbox ~60×80
+    gray[150:390, 40:260] = 220  # tułów: 220×240, 30 px ciemnego pasa pod głową
+    return gray
+
+
+def test_segment_prefers_head_with_expected_size():
+    from src.registration import segment_thermal_face
+
+    gray = _head_and_torso_thermal()
+    window = (0, 0, gray.shape[1], gray.shape[0])
+
+    mask, info = segment_thermal_face(gray, window, expected_wh=(60.0, 80.0))
+    assert mask is not None and isinstance(info, dict)
+    assert mask[80, 150] and not mask[270, 150]
+    assert info["n_candidates"] == 2
+    assert info["picked_rank"] == 1
+
+    mask_big, info_big = segment_thermal_face(gray, window)
+    assert mask_big is not None and isinstance(info_big, dict)
+    assert mask_big[270, 150] and not mask_big[80, 150]
+    assert info_big["picked_rank"] == 0
+
+
+def test_calibration_rejects_implausible_scale():
+    """W oknie priora tylko duży blob (skala > 1.0) -> ValueError."""
+    import pytest
+
+    from src.config import REG_CALIB_WINDOW_PAD, REG_PRIOR_OFFSET, REG_PRIOR_SCALE
+    from src.registration import calibrate_nominal_registration, thermal_window_from_mapping
+
+    # Twarz RGB 300×400 px w centrum klatki 4K.
+    landmarks = np.array([[1770.0, 880.0], [2070.0, 880.0], [2070.0, 1280.0], [1770.0, 1280.0]])
+    thermal = np.full((1024, 1280), 30, dtype=np.uint8)
+    x0, y0, x1, y1 = thermal_window_from_mapping(
+        landmarks, thermal.shape, REG_PRIOR_SCALE, REG_PRIOR_OFFSET, REG_CALIB_WINDOW_PAD
+    )
+    # Blob 400×550 px w termice (skala ~1.35), cały wewnątrz okna.
+    assert x0 < 400 and x1 > 800 and y0 < 250 and y1 > 800
+    thermal[250:800, 400:800] = 220
+    with pytest.raises(ValueError, match="nieprawdopodobna skala"):
+        calibrate_nominal_registration(np.zeros((8, 8, 3), np.uint8), thermal, landmarks)
+
+
+def _glasses_head_neck_shoulders() -> np.ndarray:
+    """Głowa 90 wierszy: okulary na ~40%, szyja na ~90% oczekiwanej wysokości 100, barki."""
+    comp = np.zeros((180, 140), dtype=np.uint8)
+    comp[10:100, 40:100] = 1  # głowa, szer. 60
+    comp[46:53, 40:100] = 0
+    comp[46:53, 55:85] = 1  # okulary: szer. 30 na wierszach 36–42 od góry segmentu
+    comp[100:110, 58:82] = 1  # szyja, szer. 24 (90–99 od góry)
+    comp[110:170, 5:135] = 1  # barki, szer. 130
+    return comp
+
+
+def test_neck_cut_skips_glasses_with_min_cut_rows():
+    from src.registration import _cut_neck_width_profile
+
+    comp = _glasses_head_neck_shoulders()
+    _, info_free = _cut_neck_width_profile(comp, min_cut_rows=0)
+    assert info_free["cut_row"] is not None
+    assert 40 <= info_free["cut_row"] <= 60  # tnie na okularach
+
+    out, info = _cut_neck_width_profile(comp, min_cut_rows=int(0.75 * 100))
+    assert info["cut_row"] is not None
+    assert 95 <= info["cut_row"] <= 112  # tnie na szyi
+    assert out[70, 70] == 1  # dolna część twarzy zostaje
+    assert out[140, 70] == 0  # barki odcięte
+
+
+def test_affine_is_plausible_scale_and_anisotropy():
+    from src.registration import affine_is_plausible
+
+    def sim(s: float) -> np.ndarray:
+        return np.array([[s, 0.0, 10.0], [0.0, s, 20.0]])
+
+    assert affine_is_plausible(sim(1.9))
+    assert not affine_is_plausible(sim(3.4))
+    assert not affine_is_plausible(sim(0.6))
+    assert not affine_is_plausible(np.array([[1.9, 0.0, 0.0], [0.0, 1.9 * 1.25, 0.0]]))
+
+
+def test_calibration_rejects_wide_but_low_segment():
+    """Segment ucięty na oczach: szer. ~0.62, wys. ~0.39 twarzy RGB -> ValueError."""
+    import pytest
+
+    from src.config import REG_CALIB_WINDOW_PAD, REG_PRIOR_OFFSET, REG_PRIOR_SCALE
+    from src.registration import calibrate_nominal_registration, thermal_window_from_mapping
+
+    landmarks = np.array([[1770.0, 880.0], [2070.0, 880.0], [2070.0, 1280.0], [1770.0, 1280.0]])
+    thermal = np.full((1024, 1280), 30, dtype=np.uint8)
+    x0, y0, x1, y1 = thermal_window_from_mapping(
+        landmarks, thermal.shape, REG_PRIOR_SCALE, REG_PRIOR_OFFSET, REG_CALIB_WINDOW_PAD
+    )
+    # Blob 186×156 px (bbox max-min) = 0.62 × 300 i 0.39 × 400, wewnątrz okna.
+    assert x0 < 503 and x1 > 690 and y0 < 426 and y1 > 583
+    thermal[426:583, 503:690] = 220
+    with pytest.raises(ValueError, match=r"szer\. 0\.62, wys\. 0\.39"):
+        calibrate_nominal_registration(np.zeros((8, 8, 3), np.uint8), thermal, landmarks)

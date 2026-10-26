@@ -11,6 +11,7 @@ Wymagania: Python 3.11 przez [uv](https://docs.astral.sh/uv/), model `models/fac
 uv run run.py                         # wszyscy badani z data/
 uv run run.py --subject subject04     # jeden badany
 uv run run.py --recalibrate           # wymuś ponowną kalibrację rejestracji każdej sceny
+uv run run.py --figures-only          # tylko reg_quality.json + figury rejestracji (bez HR/Polar, metryk i agregatu)
 uv run run.py --data data --out results/pipeline   # wartości domyślne
 uv run pytest                         # testy
 ```
@@ -25,6 +26,21 @@ termika→RGB z pierwszej dobrze wykrytej klatki sceny, ROI bbox z landmarków M
 sygnał **plain** (średnie RGB w ROI) i **gated** (RGB w ROI ∩ cieplejsze piksele termiki), metody **POS**
 i **CHROM**, walidacja w **4 równych oknach** (`n//4` klatek, ostatnie bierze resztę).
 Wynik: oba regiony × POS/CHROM × plain/gated — bez jednoliczbowego „headline”.
+
+**Rejestracja.** Kalibracja sceny segmentuje termikę w oknie z priora (`REG_PRIOR_SCALE`,
+`REG_PRIOR_OFFSET`, `REG_CALIB_WINDOW_PAD`) i spośród do 5 największych jasnych składowych wybiera tę
+o rozmiarze najbliższym oczekiwanej głowie. Cięcie szyi (profil szerokości) nie może wypaść wyżej niż
+`REG_NECK_MIN_FRAC` (0,75) × oczekiwana wysokość głowy od góry segmentu — inaczej u osób w okularach
+(szkła w termice są czarne) potok ciąłby twarz na wysokości oczu. Klatka jest odrzucana (bierzemy
+następną z twarzą), gdy szerokość LUB wysokość segmentu termicznego względem bboxa twarzy RGB wypada
+poza `REG_SCALE_RANGE` (0,5–1,0) — wtedy segment to nie głowa (np. tułów albo samo czoło). Brak udanej
+klatki → fallback z innej sceny (też tylko ze skalą w zakresie).
+
+**Jakość rejestracji.** Affine jest odświeżany co `AFFINE_EVERY_BY_SCENARIO[scena]` klatek. Próba jest odrzucana,
+gdy końcowy affine termika→RGB jest nieprawdopodobny: skala √|det A| poza `REG_AFFINE_SCALE_RANGE`
+(1,4–2,7) albo anizotropia σ1/σ2 macierzy 2×2 > `REG_AFFINE_MAX_ANISO` (1,15; kamery są sztywno
+złączone, więc affine to prawie podobieństwo). Odrzucona próba nie zastępuje bieżącego affine i liczy się do mediany RMS jako `inf` (`affine_implausible` w
+`reg_quality.json`). `gated_status=trustworthy`, gdy mediana RMS sceny jest skończona i ≤ 18 px.
 
 ## Katalog wyjściowy (`--out`, domyślnie `results/pipeline/`)
 

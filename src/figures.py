@@ -70,12 +70,16 @@ def _fig_thermal_seg(out_dir: Path, thermal: np.ndarray, info: dict) -> None:
     th_vis = cv2.cvtColor(th_gray, cv2.COLOR_GRAY2RGB)
     seg_mask = info["thermal_mask"]
     overlay = th_vis.copy()
-    overlay[seg_mask] = (0.45 * th_vis[seg_mask] + np.array([180, 40, 40])).astype(np.uint8)
+    overlay[seg_mask] = np.clip(
+        0.45 * th_vis[seg_mask] + np.array([180, 40, 40]), 0, 255
+    ).astype(np.uint8)
     vals = th_gray[seg_mask].astype(np.float64)
     if vals.size:
         thr = vals.mean() + 0.5 * vals.std()
         perf = seg_mask & (th_gray.astype(np.float64) >= thr)
-        overlay[perf] = (0.35 * th_vis[perf] + np.array([40, 200, 80])).astype(np.uint8)
+        overlay[perf] = np.clip(
+            0.35 * th_vis[perf] + np.array([40, 200, 80]), 0, 255
+        ).astype(np.uint8)
     win = info["window"]
     cv2.rectangle(overlay, (win[0], win[1]), (win[2], win[3]), (0, 255, 255), 2)
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -128,17 +132,24 @@ def _fig_overlay_reg(
         (0, 255, 255),
         2,
     )
-    fig, ax = plt.subplots(figsize=(6, 7.5))
-    ax.imshow(_crop(blend, _face_crop_bounds(landmarks)))
-    ax.set_title(
+    title = (
         f"Nakładka termika→RGB (1. udana klatka)\n"
         f"RMS klatki={first_quality['contour_rms_px']:.1f} px  "
         f"IoU={first_quality['iou']:.2f}\n"
         f"scena: mediana RMS={scene_quality.contour_rms_px:.1f} px, "
         f"dobre próby {100 * scene_quality.good_frac:.0f}% "
-        f"z {scene_quality.n_attempts}  ({scene_quality.gate_label})",
-        fontsize=10,
+        f"z {scene_quality.n_attempts}  ({scene_quality.gate_label})"
     )
+    if first_quality.get("scale_ok") is False:
+        title += (
+            f"\naffine poza zakresem: "
+            f"skala={first_quality.get('affine_scale', float('nan')):.2f}, "
+            f"anizotropia={first_quality.get('affine_aniso', float('nan')):.2f} "
+            f"— próba odrzucona"
+        )
+    fig, ax = plt.subplots(figsize=(6, 7.5))
+    ax.imshow(_crop(blend, _face_crop_bounds(landmarks)))
+    ax.set_title(title, fontsize=10)
     ax.axis("off")
     fig.savefig(out_dir / "fig_overlay_reg.png", dpi=FIG_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -280,6 +291,22 @@ def _fig_spectrum(
     plt.close(fig)
 
 
+def save_registration_figures(
+    out_dir: Path,
+    *,
+    rgb: np.ndarray,
+    thermal: np.ndarray,
+    landmarks: np.ndarray,
+    reg_info: dict,
+    first_quality: dict,
+    scene_quality: SceneRegistrationQuality,
+) -> None:
+    """Figury rejestracji: ``fig_rgb_roi``, ``fig_thermal_seg``, ``fig_overlay_reg``."""
+    _fig_rgb_roi(out_dir, rgb, landmarks)
+    _fig_thermal_seg(out_dir, thermal, reg_info)
+    _fig_overlay_reg(out_dir, rgb, thermal, landmarks, reg_info, first_quality, scene_quality)
+
+
 def save_scene_figures(
     out_dir: Path,
     *,
@@ -297,9 +324,15 @@ def save_scene_figures(
     rows: list[dict],
 ) -> None:
     """Wszystkie ``fig_*.png`` sceny; obraz/maska/affine z pierwszej udanej rejestracji."""
-    _fig_rgb_roi(out_dir, rgb, landmarks)
-    _fig_thermal_seg(out_dir, thermal, reg_info)
-    _fig_overlay_reg(out_dir, rgb, thermal, landmarks, reg_info, first_quality, scene_quality)
+    save_registration_figures(
+        out_dir,
+        rgb=rgb,
+        thermal=thermal,
+        landmarks=landmarks,
+        reg_info=reg_info,
+        first_quality=first_quality,
+        scene_quality=scene_quality,
+    )
     _fig_hr_windows(out_dir, cleaned, window_hrs, polar, fs, duration_s)
     _fig_spectrum(out_dir, cleaned, fs, rows)
     print(f"Figury → {out_dir}/fig_*.png")

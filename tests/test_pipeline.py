@@ -45,3 +45,17 @@ def test_ref_suspect_comes_from_config(monkeypatch):
     monkeypatch.setattr(pipeline, "REF_SUSPECT_SUBJECTS", ("subject07",))
     assert is_ref_suspect("subject07")
     assert not is_ref_suspect("subject03")
+
+
+def test_scene_quality_counts_implausible_attempts_as_inf():
+    """inf (próba odrzucona za skalę) wchodzi do mediany; NaN nie."""
+    first = {"contour_rms_px": 10.0, "iou": 0.8}
+    q = _scene_registration_quality([10.0, 12.0, np.inf], [0.8, 0.8, np.nan], first, threshold=THR)
+    assert q.contour_rms_px == 12.0
+    assert q.trustworthy
+
+    q_bad = _scene_registration_quality(
+        [np.inf, np.inf, 10.0], [np.nan, np.nan, 0.8], first, threshold=THR
+    )
+    assert not np.isfinite(q_bad.contour_rms_px)
+    assert not q_bad.trustworthy

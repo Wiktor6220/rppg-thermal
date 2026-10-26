@@ -146,6 +146,8 @@ def collect_scene_rows(out_root: Path) -> list[dict]:
                 row = {k: _parse_cell(v) for k, v in raw.items()}
                 row["subject"] = raw["subject"]
                 row["scenario"] = raw["scenario"]
+                # Flaga z bieżącego configu, nie z metrics.csv zapisanego wcześniejszym przebiegiem.
+                row["ref_suspect"] = raw["subject"] in REF_SUSPECT_SUBJECTS
                 rows.append(row)
     return rows
 
@@ -177,14 +179,13 @@ def write_all_subjects_csv(all_rows: list[dict], out_root: Path) -> Path:
 
 def _verdict_lines(all_rows: list[dict]) -> list[str]:
     """Krótki werdykt liczony wyłącznie z wierszy tabeli."""
-    suspects = ", ".join(REF_SUSPECT_SUBJECTS) or "—"
-    lines = [
-        "",
-        "## Krótki werdykt",
-        "",
-        f"Statystyki poniżej liczone bez badanych z `ref_suspect=True` ({suspects}).",
-        "",
-    ]
+    lines = ["", "## Krótki werdykt", ""]
+    if REF_SUSPECT_SUBJECTS:
+        suspects = ", ".join(REF_SUSPECT_SUBJECTS)
+        lines += [
+            f"Statystyki poniżej liczone bez badanych z `ref_suspect=True` ({suspects}).",
+            "",
+        ]
     nogo = sorted(
         {
             (r["subject"], r["scenario"])
@@ -275,10 +276,15 @@ def write_summary(out_root: Path) -> list[dict]:
         "",
         f"Badani w agregacie ({len(subjects)}): {', '.join(subjects) if subjects else '—'}.",
         "",
-        f"`ref_suspect=True` ({', '.join(REF_SUSPECT_SUBJECTS) or '—'}): flaga oznacza "
-        "nietypowo wysokie HR referencji Polar. Wiersze tych badanych zostają w tabeli; "
-        "werdykt liczy statystyki bez nich.",
-        "",
+    ]
+    if REF_SUSPECT_SUBJECTS:
+        lines += [
+            f"`ref_suspect=True` ({', '.join(REF_SUSPECT_SUBJECTS)}): flaga oznacza "
+            "nietypowo wysokie HR referencji Polar. Wiersze tych badanych zostają w tabeli; "
+            "werdykt liczy statystyki bez nich.",
+            "",
+        ]
+    lines += [
         f"Rejestracja: `reg_rms_px`/`reg_iou` = mediana z prób odświeżenia affine w scenie, "
         f"`reg_rms_first_px` = pierwsza próba, `reg_good_frac` = udział prób z RMS ≤ "
         f"{REG_GO_RMS_PX:.0f} px; `gated_status=trustworthy`, gdy mediana ≤ progu.",

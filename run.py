@@ -3,6 +3,7 @@
     uv run run.py                      # wszyscy badani z data/
     uv run run.py --subject subject04  # jeden badany (agregat obejmuje cały --out)
     uv run run.py --recalibrate        # wymuś ponowną kalibrację rejestracji per scena
+    uv run run.py --figures-only       # tylko figury rejestracji, bez HR i metryk
 """
 
 import argparse
@@ -24,6 +25,11 @@ def _parse_args() -> argparse.Namespace:
         help="Przelicz reg_calib.json każdej sceny",
     )
     parser.add_argument(
+        "--figures-only",
+        action="store_true",
+        help="Tylko rejestracja i jej figury (bez Polar HR, metryk i agregatu)",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=PIPELINE_RESULTS_DIR,
@@ -34,4 +40,10 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_pipeline(args.data, args.out, subject=args.subject, recalibrate=args.recalibrate)
+    run_pipeline(
+        args.data,
+        args.out,
+        subject=args.subject,
+        recalibrate=args.recalibrate,
+        figures_only=args.figures_only,
+    )

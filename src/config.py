@@ -14,7 +14,7 @@ WELCH_SEGMENT_SEC: float = 10.0
 # --- Eval ---
 # Badani z nietypowo wysokim HR referencji: zostają w tabelach,
 # werdykt w summary.md liczy statystyki bez nich.
-REF_SUSPECT_SUBJECTS: tuple[str, ...] = ("subject03",)
+REF_SUSPECT_SUBJECTS: tuple[str, ...] = ()
 MIN_VALID_RATIO: float = 0.5  # min. udział valid[] w oknie
 # 4 równe okna (n//4 klatek; ostatnie bierze resztę)
 N_QUARTER_WINDOWS: int = 4
@@ -38,8 +38,21 @@ AFFINE_EVERY_BY_SCENARIO: dict[str, int] = {
 AFFINE_EVERY_DEFAULT: int = 30
 
 # --- Korejestracja ---
-REG_NOMINAL_SCALE: float = 0.52
-REG_NOMINAL_OFFSET: tuple[float, float] = (-340.0, -60.0)  # px termiki
+# Prior rozmiaru/położenia głowy w termice (nigdy nie nadpisywany w runtime).
+# Rozmiar głowy w termice / bbox twarzy RGB; mediana poprawnych kalibracji.
+REG_PRIOR_SCALE: float = 0.67
+REG_PRIOR_OFFSET: tuple[float, float] = (-690.0, -220.0)  # px termiki
+REG_SCALE_RANGE: tuple[float, float] = (0.5, 1.0)  # poza zakresem = segment nie jest głową
+REG_CALIB_WINDOW_PAD: float = 2.5
+# Cięcie szyi nie wyżej niż ten ułamek oczekiwanej wysokości głowy od góry segmentu.
+REG_NECK_MIN_FRAC: float = 0.75
+# Skala affine termika->RGB (sqrt|det|); poprawne 1.45–2.5.
+REG_AFFINE_SCALE_RANGE: tuple[float, float] = (1.4, 2.7)
+# sigma1/sigma2 macierzy 2×2 affine; kamery sztywne -> prawie podobieństwo.
+REG_AFFINE_MAX_ANISO: float = 1.15
+# Bieżące odwzorowanie nominalne; per scena nadpisywane z reg_calib.json.
+REG_NOMINAL_SCALE: float = REG_PRIOR_SCALE
+REG_NOMINAL_OFFSET: tuple[float, float] = REG_PRIOR_OFFSET  # px termiki
 REG_WINDOW_PAD: float = 2.0
 REG_MORPH_KERNEL: int = 7
 REG_NECK_WIDTH_FRAC: float = 0.62
